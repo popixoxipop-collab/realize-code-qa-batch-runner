@@ -16,6 +16,22 @@ test("parallel CLI requires explicit classes and live confirmation", () => {
   assert.throws(() => parseParallelArgs(["--classes", "A,A", "--dry-run"]), { code: "DUPLICATE_CLASS" });
 });
 
+test("autonomous CLI selects GMI, team preparation, and bounded tuning options", () => {
+  const options = parseParallelArgs([
+    "--autonomous",
+    "--classes", "f",
+    "--repo", "https://github.com/example/project",
+    "--llm-concurrency", "12",
+    "--analysis-timeout-minutes", "90",
+    "--dry-run",
+  ]);
+  assert.equal(options.answerProvider, "gmi");
+  assert.equal(options.prepareRepository, true);
+  assert.equal(options.repositoryUrl, "https://github.com/example/project");
+  assert.equal(options.llmConcurrency, 12);
+  assert.equal(options.analysisTimeoutMs, 90 * 60_000);
+});
+
 test("bounded scheduler never exceeds configured concurrency", async () => {
   let active = 0;
   let maximum = 0;
@@ -79,6 +95,29 @@ test("a failed account stops only its team lane", async () => {
   assert.equal(results[1].status, "complete");
   assert.equal(visited.includes("a2"), false);
   assert.equal(visited.includes("b2"), true);
+});
+
+test("a failed team preparation stops only that lane before any account starts", async () => {
+  const groups = groupAccountsByTeam([
+    { accountId: "a1", teamName: "1팀" },
+    { accountId: "b1", teamName: "2팀" },
+  ]);
+  const visited = [];
+  const results = await runTeamLanes({
+    groups,
+    concurrency: 2,
+    prepareTeam: async (group) => {
+      if (group.teamName === "1팀") throw Object.assign(new Error("analysis failed"), { code: "ANALYSIS_FAILED" });
+    },
+    runAccount: async (account) => {
+      visited.push(account.accountId);
+      return account.accountId;
+    },
+  });
+  assert.equal(results[0].status, "failed");
+  assert.equal(results[0].phase, "prepare");
+  assert.equal(results[0].failedAccount, null);
+  assert.deepEqual(visited, ["b1"]);
 });
 
 test("central answer broker serializes concurrent questions", async () => {

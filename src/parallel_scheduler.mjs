@@ -49,10 +49,25 @@ export function groupAccountsByTeam(accounts) {
   return [...groups].map(([teamName, teamAccounts]) => Object.freeze({ teamName, accounts: Object.freeze(teamAccounts) }));
 }
 
-export async function runTeamLanes({ groups, concurrency, runAccount }) {
+export async function runTeamLanes({ groups, concurrency, runAccount, prepareTeam = null }) {
   invariant(Array.isArray(groups), "INVALID_TEAM_GROUPS", "groups must be an array.");
   return mapConcurrent(groups, concurrency, async (group) => {
     const completed = [];
+    if (prepareTeam) {
+      invariant(typeof prepareTeam === "function", "INVALID_TEAM_PREPARER", "prepareTeam must be a function.");
+      try {
+        await prepareTeam(group);
+      } catch (error) {
+        return {
+          teamName: group.teamName,
+          status: "failed",
+          phase: "prepare",
+          completed,
+          failedAccount: null,
+          error,
+        };
+      }
+    }
     for (const account of group.accounts) {
       try {
         completed.push(await runAccount(account, group));
@@ -60,6 +75,7 @@ export async function runTeamLanes({ groups, concurrency, runAccount }) {
         return {
           teamName: group.teamName,
           status: "failed",
+          phase: "account",
           completed,
           failedAccount: account,
           error,

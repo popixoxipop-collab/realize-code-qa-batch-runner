@@ -1,4 +1,7 @@
 node_modules/
+.env
+.env.*
+!.env.example
 runs/
 realize.config.json
 portal-driver.local.mjs

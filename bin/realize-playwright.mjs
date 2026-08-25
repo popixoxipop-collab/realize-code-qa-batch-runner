@@ -12,6 +12,7 @@ import { groupAccountsByTeam, runTeamLanes } from "../src/parallel_scheduler.mjs
 
 const DEFAULT_BASE_URL = "https://frontend-eight-neon-73.vercel.app";
 const DEFAULT_CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+export const DEFAULT_REPOSITORY_URL = "https://github.com/Team-IZ/Backend";
 
 export class AdaptiveNetworkWaits {
   constructor({ alpha = 0.35, minimumMs = 15_000, maximumMs = 300_000 } = {}) {
@@ -71,6 +72,11 @@ function parseArgs(argv) {
     baseUrl: DEFAULT_BASE_URL,
     chromePath: DEFAULT_CHROME,
     limit: Number.POSITIVE_INFINITY,
+    repositoryUrl: DEFAULT_REPOSITORY_URL,
+    repositoryBranch: "",
+    prepareRepository: false,
+    analysisTimeoutMs: 45 * 60_000,
+    analysisPollMs: 15_000,
   };
   for (let index = 0; index < argv.length; index += 1) {
     const option = argv[index];
@@ -86,6 +92,11 @@ function parseArgs(argv) {
     else if (option === "--base-url") options.baseUrl = next().replace(/\/$/u, "");
     else if (option === "--chrome") options.chromePath = next();
     else if (option === "--ledger") options.ledgerPath = resolve(next());
+    else if (option === "--repo") options.repositoryUrl = next();
+    else if (option === "--branch") options.repositoryBranch = next();
+    else if (option === "--prepare-repository") options.prepareRepository = true;
+    else if (option === "--analysis-timeout-minutes") options.analysisTimeoutMs = Number(next()) * 60_000;
+    else if (option === "--analysis-poll-seconds") options.analysisPollMs = Number(next()) * 1_000;
     else if (option === "--headed") options.headless = false;
     else if (option === "--help" || option === "-h") options.help = true;
     else fail("UNKNOWN_OPTION", `Unknown option: ${option}`);
@@ -94,8 +105,41 @@ function parseArgs(argv) {
   if (!(options.limit === Number.POSITIVE_INFINITY || (Number.isInteger(options.limit) && options.limit > 0))) {
     fail("INVALID_LIMIT", "--limit must be a positive integer.");
   }
+  canonicalRepository(options.repositoryUrl);
+  if (!Number.isFinite(options.analysisTimeoutMs) || options.analysisTimeoutMs < 60_000) fail("INVALID_ANALYSIS_TIMEOUT", "--analysis-timeout-minutes must be at least 1.");
+  if (!Number.isFinite(options.analysisPollMs) || options.analysisPollMs < 1_000) fail("INVALID_ANALYSIS_POLL", "--analysis-poll-seconds must be at least 1.");
   options.ledgerPath ??= resolve("runs", `playwright-${options.className}.ndjson`);
   return options;
+}
+
+export function canonicalRepository(value) {
+  let url;
+  try {
+    url = new URL(String(value));
+  } catch {
+    fail("INVALID_REPOSITORY", "저장소는 일반 HTTPS GitHub owner/repository URL이어야 합니다.");
+  }
+  const segments = url.pathname.replace(/^\/+|\/+$/gu, "").replace(/\.git$/iu, "").split("/");
+  if (url.protocol !== "https:" || !["github.com", "www.github.com"].includes(url.hostname.toLowerCase()) || url.username || url.password || url.search || url.hash || segments.length !== 2 || segments.some((segment) => !/^[A-Za-z0-9._-]+$/u.test(segment))) {
+    fail("INVALID_REPOSITORY", "저장소는 일반 HTTPS GitHub owner/repository URL이어야 합니다.");
+  }
+  return Object.freeze({
+    url: `https://github.com/${segments[0]}/${segments[1]}`,
+    slug: `${segments[0]}/${segments[1]}`,
+    identity: `${segments[0]}/${segments[1]}`.toLowerCase(),
+  });
+}
+
+export function classifyHomeState(body) {
+  const text = String(body ?? "");
+  if (text.includes("이해도 확인이 끝났어요") || text.includes("리포트를 기다리는 중이에요") || text.includes("다시 볼 수 있는 문제가 있어요")) return "complete";
+  if (text.includes("이해도 확인이 진행 중이에요")) return "in_progress";
+  if (text.includes("이해도 확인을 시작할 차례예요")) return "ready";
+  if (text.includes("코드를 분석하지 못했어요")) return "analysis_failed";
+  if (text.includes("코드 분석이 진행 중이에요")) return "analyzing";
+  if (text.includes("코드를 제출할 차례예요")) return "submission_required";
+  if (text.includes("제출 기한이 지났어요")) return "submission_closed";
+  return "unknown";
 }
 
 export function parseTraineeButtonLabel(label, className) {
@@ -209,6 +253,146 @@ async function loginAs(page, options, account, waits) {
     }
   }
   fail("LOGIN_NETWORK_FAILED", "로그인 뒤 회차 정보를 받지 못했습니다.", { outcome: lastOutcome, adaptive: waits.snapshot("home") });
+}
+
+function bodyContainsRepository(body, repository) {
+  const normalized = String(body ?? "").normalize("NFKC").toLowerCase();
+  return normalized.includes(repository.identity) || normalized.includes(repository.url.toLowerCase());
+}
+
+async function openSubmissionPage(page, options, waits) {
+  await page.goto(`${options.baseUrl}/trainee/submission`, { waitUntil: "domcontentloaded", timeout: waits.timeoutFor("home") });
+  await page.getByRole("heading", { name: /코드 제출$/u }).waitFor({ timeout: waits.timeoutFor("home") });
+  await page.waitForTimeout(300);
+  return page.locator("body").innerText();
+}
+
+function submissionPageState(body) {
+  if (body.includes("코드를 분석하지 못했어요")) return "analysis_failed";
+  if (body.includes("분석이 끝났어요") || body.includes("이제 다시 제출할 수 없어요")) return "ready";
+  if (body.includes("제출됐어요. 코드를 분석하고 있습니다") || body.includes("제출 완료")) return "analyzing";
+  if (body.includes("제출 기한이 지났어요")) return "submission_closed";
+  if (body.includes("저장소 주소") && body.includes("주소 확인")) return "draft";
+  return "unknown";
+}
+
+async function inspectExpectedRepository(page, options, waits, repository) {
+  const body = await openSubmissionPage(page, options, waits);
+  const state = submissionPageState(body);
+  if (!["draft", "submission_closed", "unknown"].includes(state) && !bodyContainsRepository(body, repository)) {
+    fail("REPOSITORY_MISMATCH", "현재 팀에 제출된 저장소가 요청한 저장소와 다릅니다.", { expectedRepository: repository.slug, state });
+  }
+  if (state === "analysis_failed") {
+    const failureText = body.split("\n").filter(Boolean).slice(0, 30).join("\n");
+    fail("ANALYSIS_FAILED", "제출된 저장소의 코드 분석이 실패했습니다.", { expectedRepository: repository.slug, visibleText: failureText.slice(0, 1_500) });
+  }
+  if (state === "submission_closed") fail("SUBMISSION_CLOSED", "저장소 제출 기한이 지났습니다.");
+  if (state === "unknown") fail("UNKNOWN_SUBMISSION_STATE", "처리하지 않은 코드 제출 화면입니다.", { visibleText: body.slice(0, 1_500) });
+  return { state, body };
+}
+
+async function submitRepository(page, options, account, waits, repository) {
+  const body = await openSubmissionPage(page, options, waits);
+  if (submissionPageState(body) !== "draft") return inspectExpectedRepository(page, options, waits, repository);
+  const input = page.locator("#repo-url");
+  await input.waitFor({ state: "visible", timeout: waits.timeoutFor("home") });
+  await pressVerified(input, repository.url);
+  const checkOutcome = await waitForApiOutcome(page, waits, {
+    category: "repository_check",
+    method: "POST",
+    path: "/api/v0/submissions/repository-checks",
+    action: () => page.getByRole("button", { name: "주소 확인", exact: true }).click(),
+  });
+  if (checkOutcome.kind !== "response" || !checkOutcome.ok) fail("REPOSITORY_CHECK_FAILED", "GitHub 저장소 주소 확인에 실패했습니다.", { outcome: checkOutcome });
+  await page.getByText(new RegExp(`${repository.slug.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")} 확인했어요`, "iu")).waitFor({ timeout: waits.timeoutFor("repository_check") });
+  if (options.repositoryBranch) await pressVerified(page.locator("#repo-branch"), options.repositoryBranch);
+  const submitButton = page.getByRole("button", { name: "제출", exact: true });
+  if (!(await submitButton.isEnabled())) fail("REPOSITORY_SUBMIT_DISABLED", "저장소 제출 버튼이 활성화되지 않았습니다.");
+  await journal(options.ledgerPath, { event: "team_submission_intent", teamName: account.teamName, accountId: account.accountId, repository: repository.identity, branch: options.repositoryBranch || null });
+  const submitOutcome = await waitForApiOutcome(page, waits, {
+    category: "repository_submit",
+    method: "POST",
+    path: "/api/v0/submissions",
+    action: () => submitButton.click(),
+  });
+  if (submitOutcome.kind !== "response" || !submitOutcome.ok) fail("REPOSITORY_SUBMIT_FAILED", "저장소 제출 응답을 확인하지 못했습니다.", { outcome: submitOutcome });
+  await page.getByText(/제출됐어요|제출 완료/u).first().waitFor({ timeout: waits.timeoutFor("repository_submit") });
+  const inspected = await inspectExpectedRepository(page, options, waits, repository);
+  await journal(options.ledgerPath, { event: "team_submission_submitted_unverified", teamName: account.teamName, accountId: account.accountId, repository: repository.identity });
+  emit({ event: "team_submission", className: options.className, teamName: account.teamName, accountId: account.accountId, repository: repository.slug, status: "submitted_unverified" });
+  return { ...inspected, submitted: true };
+}
+
+async function currentHomeState(page) {
+  await page.waitForTimeout(300);
+  return classifyHomeState(await page.locator("body").innerText());
+}
+
+async function waitForAnalysisReady(page, options, account, waits) {
+  const deadline = Date.now() + options.analysisTimeoutMs;
+  let polls = 0;
+  while (Date.now() < deadline) {
+    await page.goto(`${options.baseUrl}/trainee/home`, { waitUntil: "domcontentloaded", timeout: waits.timeoutFor("home") });
+    await waitForHome(page, account.displayName, waits);
+    const state = await currentHomeState(page);
+    emit({ event: "analysis_state", className: options.className, teamName: account.teamName, accountId: account.accountId, state, polls });
+    if (["ready", "in_progress", "complete"].includes(state)) return state;
+    if (state === "analysis_failed") fail("ANALYSIS_FAILED", "저장소 코드 분석이 실패했습니다.", { teamName: account.teamName });
+    if (state !== "analyzing") fail("ANALYSIS_STATE_CHANGED", "분석 대기 중 예상하지 못한 홈 상태로 바뀌었습니다.", { state, teamName: account.teamName });
+    polls += 1;
+    const jitter = 0.85 + Math.random() * 0.3;
+    await page.waitForTimeout(Math.min(deadline - Date.now(), Math.round(options.analysisPollMs * jitter)));
+  }
+  fail("ANALYSIS_TIMEOUT", "분석 준비 제한 시간을 초과했습니다.", { teamName: account.teamName, timeoutMs: options.analysisTimeoutMs });
+}
+
+export async function preparePlaywrightTeam({ browser, options, accounts, waits = new AdaptiveNetworkWaits() }) {
+  if (!Array.isArray(accounts) || accounts.length === 0) fail("EMPTY_TEAM", "팀 준비에 사용할 교육생 계정이 없습니다.");
+  const representative = accounts[0];
+  const verifier = accounts.find((account) => account.accountId !== representative.accountId);
+  const repository = canonicalRepository(options.repositoryUrl);
+  const representativeContext = await browser.newContext();
+  try {
+    const page = await representativeContext.newPage();
+    emit({ event: "team_prepare_start", className: options.className, teamName: representative.teamName, accountId: representative.accountId, repository: repository.slug });
+    await loginAs(page, options, representative, waits);
+    const initialState = await currentHomeState(page);
+    let submission;
+    if (initialState === "submission_required") submission = await submitRepository(page, options, representative, waits, repository);
+    else if (initialState === "analysis_failed") fail("ANALYSIS_FAILED", "대표 계정에서 저장소 분석 실패 상태를 확인했습니다.", { teamName: representative.teamName });
+    else if (["analyzing", "ready", "in_progress", "complete"].includes(initialState)) submission = await inspectExpectedRepository(page, options, waits, repository);
+    else if (initialState === "submission_closed") fail("SUBMISSION_CLOSED", "저장소 제출 기한이 지났습니다.", { teamName: representative.teamName });
+    else fail("UNKNOWN_TEAM_STATE", "팀 대표 계정의 홈 상태를 판정하지 못했습니다.", { visibleText: (await page.locator("body").innerText()).slice(0, 1_500) });
+
+    if (!verifier) fail("TEAM_CONFIRMATION_UNAVAILABLE", "팀 제출 상태를 확인할 두 번째 교육생 계정이 없습니다.", { teamName: representative.teamName });
+    const verifierContext = await browser.newContext();
+    try {
+      const verifierPage = await verifierContext.newPage();
+      await loginAs(verifierPage, options, verifier, new AdaptiveNetworkWaits());
+      let verifierState = await currentHomeState(verifierPage);
+      for (let confirmationAttempt = 0; verifierState === "submission_required" && confirmationAttempt < 3; confirmationAttempt += 1) {
+        await verifierPage.waitForTimeout(Math.min(10_000, options.analysisPollMs));
+        await verifierPage.reload({ waitUntil: "domcontentloaded", timeout: waits.timeoutFor("home") });
+        await waitForHome(verifierPage, verifier.displayName, waits);
+        verifierState = await currentHomeState(verifierPage);
+      }
+      if (["submission_required", "submission_closed", "unknown"].includes(verifierState)) {
+        fail("TEAM_SUBMISSION_UNCONFIRMED", "두 번째 팀원 계정에서 팀 저장소 제출 상태를 확인하지 못했습니다.", { teamName: representative.teamName, verifierState });
+      }
+      await inspectExpectedRepository(verifierPage, options, new AdaptiveNetworkWaits(), repository);
+      await journal(options.ledgerPath, { event: "team_submission_confirmed", teamName: representative.teamName, representativeAccountId: representative.accountId, verifierAccountId: verifier.accountId, repository: repository.identity, origin: submission.submitted ? "this_run" : "preexisting" });
+      emit({ event: "team_submission", className: options.className, teamName: representative.teamName, repository: repository.slug, status: "confirmed", origin: submission.submitted ? "this_run" : "preexisting" });
+    } finally {
+      await verifierContext.close();
+    }
+
+    const state = await waitForAnalysisReady(page, options, representative, waits);
+    await journal(options.ledgerPath, { event: "team_analysis_ready", teamName: representative.teamName, accountId: representative.accountId, repository: repository.identity, state });
+    emit({ event: "team_prepare_result", className: options.className, teamName: representative.teamName, repository: repository.slug, status: "ready", state });
+    return { status: "ready", state, submitted: submission.submitted === true };
+  } finally {
+    await representativeContext.close();
+  }
 }
 
 export async function discoverRoster(browser, options) {
@@ -337,7 +521,7 @@ async function reconcileAnswerAfterFailure(page, waits, fingerprint) {
 
 async function runAssessment(page, answerProvider, options, account, waits) {
   let body = await page.locator("body").innerText();
-  if (body.includes("이해도 확인이 끝났어요")) return { status: "complete", skipped: true };
+  if (classifyHomeState(body) === "complete") return { status: "complete", skipped: true };
   const continuing = body.includes("이해도 확인이 진행 중이에요");
   if (!continuing && !body.includes("이해도 확인을 시작할 차례예요")) {
     fail("ACCOUNT_NOT_READY", "현재 계정은 이해도 확인 시작 상태가 아닙니다.", { visibleText: body.slice(0, 1_500) });
@@ -493,12 +677,13 @@ export async function runPlaywrightAccount({ browser, options, account, answerPr
 
 export async function runPlaywrightClass({ browser, options, answerProvider, teamConcurrency = 1, dryRun = false }) {
   if (!Number.isInteger(teamConcurrency) || teamConcurrency < 1) fail("INVALID_TEAM_CONCURRENCY", "teamConcurrency must be a positive integer.");
-  const roster = await discoverRoster(browser, options);
+  const roster = (await discoverRoster(browser, options)).map((account) => ({ ...account, className: options.className }));
   const selected = roster
     .slice(options.startAt - 1, options.startAt - 1 + options.limit)
-    .map((account) => ({ ...account, className: options.className }));
+    .map((account) => ({ ...account }));
   if (selected.length === 0) fail("EMPTY_SELECTION", "선택 범위에 교육생 계정이 없습니다.", { className: options.className, startAt: options.startAt });
   const groups = groupAccountsByTeam(selected);
+  const fullGroups = new Map(groupAccountsByTeam(roster).map((group) => [group.teamName, group]));
   emit({
     event: "plan",
     className: options.className,
@@ -507,6 +692,8 @@ export async function runPlaywrightClass({ browser, options, answerProvider, tea
     teamCount: groups.length,
     teamConcurrency: Math.min(teamConcurrency, groups.length),
     startAt: options.startAt,
+    prepareRepository: options.prepareRepository === true,
+    repository: options.prepareRepository ? canonicalRepository(options.repositoryUrl).slug : null,
     dryRun,
     selected: selected.map(({ teamName, displayName, accountId }) => ({ teamName, displayName, accountId })),
   });
@@ -515,6 +702,14 @@ export async function runPlaywrightClass({ browser, options, answerProvider, tea
   const results = await runTeamLanes({
     groups,
     concurrency: teamConcurrency,
+    prepareTeam: options.prepareRepository
+      ? async (group) => preparePlaywrightTeam({
+        browser,
+        options,
+        accounts: fullGroups.get(group.teamName)?.accounts ?? group.accounts,
+        waits: new AdaptiveNetworkWaits(),
+      })
+      : null,
     runAccount: async (account) => runPlaywrightAccount({ browser, options, account, answerProvider, waits: new AdaptiveNetworkWaits() }),
   });
   for (const result of results) {
@@ -523,7 +718,8 @@ export async function runPlaywrightClass({ browser, options, answerProvider, tea
         event: "team_failed",
         className: options.className,
         teamName: result.teamName,
-        accountId: result.failedAccount.accountId,
+        phase: result.phase,
+        accountId: result.failedAccount?.accountId ?? null,
         code: result.error?.code ?? "PLAYWRIGHT_TEAM_FAILED",
         message: result.error?.message ?? String(result.error),
         details: result.error?.details ?? {},

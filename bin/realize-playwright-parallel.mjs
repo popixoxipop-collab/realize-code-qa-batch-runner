@@ -6,7 +6,8 @@ import { stdin, stdout } from "node:process";
 
 import { chromium } from "playwright-core";
 
-import { emit, runPlaywrightClass } from "./realize-playwright.mjs";
+import { createGmiAnswerProvider } from "../src/gmi_answer_provider.mjs";
+import { canonicalRepository, DEFAULT_REPOSITORY_URL, emit, runPlaywrightClass } from "./realize-playwright.mjs";
 import { ExactAnswerMemo, mapConcurrent, normalizeClassList, SerialAnswerBroker } from "../src/parallel_scheduler.mjs";
 
 const DEFAULT_BASE_URL = "https://frontend-eight-neon-73.vercel.app";
@@ -28,6 +29,18 @@ export function parseParallelArgs(argv) {
     ledgerDir: resolve("runs"),
     dryRun: false,
     yes: false,
+    answerProvider: "manual",
+    prepareRepository: false,
+    repositoryUrl: DEFAULT_REPOSITORY_URL,
+    repositoryBranch: "",
+    analysisTimeoutMs: 45 * 60_000,
+    analysisPollMs: 15_000,
+    llmConcurrency: 8,
+    llmTimeoutMs: 90_000,
+    llmMaxAttempts: 4,
+    gmiModel: null,
+    gmiApiUrl: null,
+    envFile: resolve(".env"),
   };
   for (let index = 0; index < argv.length; index += 1) {
     const option = argv[index];
@@ -45,6 +58,22 @@ export function parseParallelArgs(argv) {
     else if (option === "--base-url") options.baseUrl = next().replace(/\/$/u, "");
     else if (option === "--chrome") options.chromePath = next();
     else if (option === "--ledger-dir") options.ledgerDir = resolve(next());
+    else if (option === "--repo") options.repositoryUrl = next();
+    else if (option === "--branch") options.repositoryBranch = next();
+    else if (option === "--prepare-repository") options.prepareRepository = true;
+    else if (option === "--answer-provider") options.answerProvider = next().toLowerCase();
+    else if (option === "--autonomous") {
+      options.answerProvider = "gmi";
+      options.prepareRepository = true;
+    }
+    else if (option === "--analysis-timeout-minutes") options.analysisTimeoutMs = Number(next()) * 60_000;
+    else if (option === "--analysis-poll-seconds") options.analysisPollMs = Number(next()) * 1_000;
+    else if (option === "--llm-concurrency") options.llmConcurrency = Number(next());
+    else if (option === "--llm-timeout-seconds") options.llmTimeoutMs = Number(next()) * 1_000;
+    else if (option === "--llm-max-attempts") options.llmMaxAttempts = Number(next());
+    else if (option === "--gmi-model") options.gmiModel = next();
+    else if (option === "--gmi-api-url") options.gmiApiUrl = next();
+    else if (option === "--env-file") options.envFile = resolve(next());
     else if (option === "--headed") options.headless = false;
     else if (option === "--dry-run") options.dryRun = true;
     else if (option === "--yes") options.yes = true;
@@ -60,6 +89,14 @@ export function parseParallelArgs(argv) {
   if (!(options.limitPerClass === Number.POSITIVE_INFINITY || (Number.isInteger(options.limitPerClass) && options.limitPerClass > 0))) {
     fail("INVALID_LIMIT", "--limit-per-class must be a positive integer.");
   }
+  if (!["manual", "gmi"].includes(options.answerProvider)) fail("INVALID_ANSWER_PROVIDER", "--answer-provider must be manual or gmi.");
+  canonicalRepository(options.repositoryUrl);
+  if (!Number.isFinite(options.analysisTimeoutMs) || options.analysisTimeoutMs < 60_000) fail("INVALID_ANALYSIS_TIMEOUT", "--analysis-timeout-minutes must be at least 1.");
+  if (!Number.isFinite(options.analysisPollMs) || options.analysisPollMs < 1_000) fail("INVALID_ANALYSIS_POLL", "--analysis-poll-seconds must be at least 1.");
+  for (const [name, value] of [["--llm-concurrency", options.llmConcurrency], ["--llm-max-attempts", options.llmMaxAttempts]]) {
+    if (!Number.isInteger(value) || value < 1) fail("INVALID_LLM_OPTION", `${name} must be a positive integer.`);
+  }
+  if (!Number.isInteger(options.llmTimeoutMs) || options.llmTimeoutMs < 1_000) fail("INVALID_LLM_OPTION", "--llm-timeout-seconds must be at least 1.");
   if (!options.dryRun && !options.yes) fail("LIVE_CONFIRMATION_REQUIRED", "Live parallel execution requires --yes. Run --dry-run first.");
   return options;
 }
@@ -76,48 +113,58 @@ function publicAccount(account) {
 export async function main(argv) {
   const options = parseParallelArgs(argv);
   if (options.help) {
-    stdout.write("Usage: npm run playwright:parallel -- --classes A,B,C,D,E,F --class-concurrency 6 --team-concurrency 5 --yes [--headed]\n");
-    stdout.write("Preview: npm run playwright:parallel -- --classes A,B,C,D,E,F --dry-run\n");
+    stdout.write("Autonomous: npm run autonomous -- --classes A,B,C,D,E,F --class-concurrency 6 --team-concurrency 5 --yes [--headed]\n");
+    stdout.write("Manual: npm run playwright:parallel -- --classes A,B,C,D,E,F --class-concurrency 6 --team-concurrency 5 --yes [--headed]\n");
+    stdout.write("Preview: npm run autonomous -- --classes A,B,C,D,E,F --dry-run\n");
     return;
   }
 
-  const browser = await chromium.launch({ headless: options.headless, executablePath: options.chromePath });
-  const reader = options.dryRun ? null : createInterface({ input: stdin, output: stdout });
-  const broker = options.dryRun ? null : new SerialAnswerBroker({
-    ask: ({ requestId }) => reader.question(`ANSWER[${requestId}]> `),
-    onQueued: ({ requestId, waiting, payload }) => emit({
-      event: "answer_queued",
-      requestId,
-      waiting,
-      account: publicAccount(payload.account),
-      attempt: payload.attempt,
-      fingerprint: payload.fingerprint,
-    }),
-    onActive: ({ requestId, waiting, payload }) => emit({ event: "answer_required", requestId, waiting, ...payload }),
-  });
-  const answerMemo = options.dryRun ? null : new ExactAnswerMemo({
-    resolveAnswer: (payload) => broker.request(payload),
-    onReuse: ({ fingerprint, source, payload }) => emit({
-      event: "answer_reused",
-      fingerprint,
-      source,
-      account: publicAccount(payload.account),
-      attempt: payload.attempt,
-    }),
-  });
-
-  emit({
-    event: "parallel_plan",
-    classes: options.classes,
-    classConcurrency: Math.min(options.classConcurrency, options.classes.length),
-    teamConcurrency: options.teamConcurrency,
-    maximumActiveTeamLanes: Math.min(options.classConcurrency, options.classes.length) * options.teamConcurrency,
-    startAt: options.startAt,
-    limitPerClass: Number.isFinite(options.limitPerClass) ? options.limitPerClass : null,
-    dryRun: options.dryRun,
-  });
-
+  let browser = null;
+  const reader = !options.dryRun && options.answerProvider === "manual" ? createInterface({ input: stdin, output: stdout }) : null;
   try {
+    const broker = reader ? new SerialAnswerBroker({
+      ask: ({ requestId }) => reader.question(`ANSWER[${requestId}]> `),
+      onQueued: ({ requestId, waiting, payload }) => emit({ event: "answer_queued", requestId, waiting, account: publicAccount(payload.account), attempt: payload.attempt, fingerprint: payload.fingerprint }),
+      onActive: ({ requestId, waiting, payload }) => emit({ event: "answer_required", requestId, waiting, ...payload }),
+    }) : null;
+    const gmiProvider = !options.dryRun && options.answerProvider === "gmi" ? await createGmiAnswerProvider({
+      apiUrl: options.gmiApiUrl,
+      model: options.gmiModel,
+      repositoryUrl: canonicalRepository(options.repositoryUrl).url,
+      concurrency: options.llmConcurrency,
+      timeoutMs: options.llmTimeoutMs,
+      maxAttempts: options.llmMaxAttempts,
+      envFile: options.envFile,
+      onEvent: emit,
+    }) : null;
+    const answerMemo = options.dryRun ? null : new ExactAnswerMemo({
+      resolveAnswer: (payload) => broker ? broker.request(payload) : gmiProvider(payload),
+      onReuse: ({ fingerprint, source, payload }) => emit({
+        event: "answer_reused",
+        fingerprint,
+        source,
+        account: publicAccount(payload.account),
+        attempt: payload.attempt,
+      }),
+      onStore: ({ fingerprint, payload }) => emit({ event: "answer_generated", provider: options.answerProvider, fingerprint, account: publicAccount(payload.account), attempt: payload.attempt }),
+    });
+    browser = await chromium.launch({ headless: options.headless, executablePath: options.chromePath });
+
+    emit({
+      event: "parallel_plan",
+      classes: options.classes,
+      classConcurrency: Math.min(options.classConcurrency, options.classes.length),
+      teamConcurrency: options.teamConcurrency,
+      maximumActiveTeamLanes: Math.min(options.classConcurrency, options.classes.length) * options.teamConcurrency,
+      startAt: options.startAt,
+      limitPerClass: Number.isFinite(options.limitPerClass) ? options.limitPerClass : null,
+      answerProvider: options.answerProvider,
+      prepareRepository: options.prepareRepository,
+      repository: canonicalRepository(options.repositoryUrl).slug,
+      llmConcurrency: options.answerProvider === "gmi" ? options.llmConcurrency : null,
+      dryRun: options.dryRun,
+    });
+
     const results = await mapConcurrent(options.classes, options.classConcurrency, async (className) => {
       const classOptions = {
         className,
@@ -127,6 +174,11 @@ export async function main(argv) {
         chromePath: options.chromePath,
         headless: options.headless,
         ledgerPath: resolve(options.ledgerDir, `playwright-${className}.ndjson`),
+        prepareRepository: options.prepareRepository,
+        repositoryUrl: canonicalRepository(options.repositoryUrl).url,
+        repositoryBranch: options.repositoryBranch,
+        analysisTimeoutMs: options.analysisTimeoutMs,
+        analysisPollMs: options.analysisPollMs,
       };
       try {
         return await runPlaywrightClass({
@@ -146,7 +198,7 @@ export async function main(argv) {
     if (failedClasses.length > 0) process.exitCode = 1;
   } finally {
     reader?.close();
-    await browser.close();
+    await browser?.close();
   }
 }
 

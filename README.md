@@ -13,6 +13,7 @@ The current default review repository is [Team-IZ/Backend](https://github.com/Te
 - One parallel lane per team, with accounts sequential inside each team
 - Effective concurrency capped by requested lanes, team count, and verified isolated profiles
 - One repository submission per team, followed by analysis wait and account sessions
+- Direct GMI Cloud answer generation through its OpenAI-compatible API
 - Atomic JSON resume ledger with run-anchor validation
 - Write-ahead/confirmed journal and unresolved-intent reporting
 - Credential-shaped field/value rejection before ledger writes
@@ -21,9 +22,9 @@ The current default review repository is [Team-IZ/Backend](https://github.com/Te
 
 ## Important browser boundary
 
-A browser tab is not an isolated account. Tabs in the same Chrome profile share cookies. The live portal driver must implement `verifyIsolatedProfiles()` and prove that every configured profile maps to a distinct authentication context. The CLI refuses live execution without that proof.
+A browser tab is not an isolated account. Tabs in the same Chrome profile share cookies. The Playwright commands create a fresh `BrowserContext` for each active account and never share its authentication state. A custom live portal driver must instead implement `verifyIsolatedProfiles()` and prove that every configured profile maps to a distinct authentication context; that lower-level CLI refuses live execution without the proof.
 
-With one Chrome profile, use one lane. Five teams can run concurrently only when five isolated browser profiles/contexts exist.
+Five teams can run concurrently only when five isolated browser profiles or contexts exist.
 
 ## Install and test
 
@@ -34,6 +35,74 @@ npm run check
 ```
 
 The deterministic core uses Node's built-in test runner. The standalone browser command uses `playwright-core` with an existing local Chrome installation; it does not download or bundle a browser.
+
+## One-command autonomous run
+
+Create an ignored local `.env` once:
+
+```bash
+cp .env.example .env
+```
+
+Set the real key only inside `.env`:
+
+```dotenv
+GMI_API_KEY=replace-with-the-real-key
+GMI_MODEL=MiniMaxAI/MiniMax-M3
+```
+
+Preview the live roster and execution plan without logging in, submitting, starting a session, or calling GMI:
+
+```bash
+npm run autonomous -- --classes F --dry-run
+```
+
+Then run one class end to end:
+
+```bash
+npm run autonomous -- \
+  --classes F \
+  --repo https://github.com/Team-IZ/Backend \
+  --class-concurrency 1 \
+  --team-concurrency 5 \
+  --llm-concurrency 8 \
+  --yes
+```
+
+For all configured classes, change `--classes` to `A,B,C,D,E,F` and choose a class concurrency appropriate for the machine. The autonomous path performs this sequence in every team lane:
+
+```text
+representative login
+  -> submit only when the visible state says submission is required
+  -> verify the exact GitHub owner/repository
+  -> confirm the same team submission from a second trainee
+  -> poll analysis with jitter until ready
+  -> run each trainee session sequentially
+  -> generate answers through GMI and submit them with verified real-key input
+```
+
+The GMI adapter uses `POST https://api.gmi-serving.com/v1/chat/completions`, model `MiniMaxAI/MiniMax-M3`, and the required `User-Agent: curl/8.0`. Transient network, 408/409/425/429, and 5xx failures are retried with exponential jitter. Authentication errors fail immediately. Model requests are bounded by `--llm-concurrency`; exact duplicate prompts share one in-flight result and later duplicates reuse the in-memory answer.
+
+Neither the API key nor generated answer text is written to the ledger. Logs contain prompt fingerprints, model name, latency, retry metadata, and answer character counts only. `.env`, run ledgers, credentials, and answers are excluded from Git and npm packages.
+
+Useful autonomous options:
+
+```text
+--branch NAME                  optional repository branch
+--analysis-timeout-minutes N  maximum analysis wait; default 45
+--analysis-poll-seconds N     base poll interval with jitter; default 15
+--llm-concurrency N           maximum simultaneous GMI calls; default 8
+--llm-timeout-seconds N       timeout for one GMI attempt; default 90
+--llm-max-attempts N          transient GMI attempts; default 4
+--gmi-model ID                default MiniMaxAI/MiniMax-M3
+--gmi-api-url URL             override only for an OpenAI-compatible endpoint
+--env-file FILE               local environment file; default .env
+--start-at N                  1-based trainee resume offset per class
+--limit-per-class N           bounded verification scope
+--headed                      show Chrome windows
+```
+
+The runner fails closed instead of guessing when it sees a different repository, failed analysis, submission deadline, missing teammate confirmation, unknown portal state, exhausted re-explanation, or GMI authentication failure. A repository submit intent is journaled before the click; after interruption, the next run reconciles the visible team state and does not blindly resubmit.
 
 ## Standalone Chrome run with live-generated answers
 
@@ -51,7 +120,7 @@ Waiting is driven by the same API responses visible in Chrome DevTools Network r
 
 When the current question appears, the process emits one JSON object with `event: "answer_required"`, the visible question/code text, and an exact fingerprint, then waits at `ANSWER>`. Generate a fresh 3–5 sentence answer from that visible prompt and the pinned repository source, enter it once, and let the script continue. This is the intended direct-answer mode; no repository-specific answer bank is loaded or published.
 
-The standalone command intentionally stops if an account is not already at the understanding-session stage. Repository submission and analysis orchestration remain behind the stricter portal-adapter workflow below so an unfinished or ambiguous team submission is never replayed automatically.
+Without `--prepare-repository`, the standalone command intentionally stops if an account is not already at the understanding-session stage. The `autonomous` command enables the stricter team preparation flow described above.
 
 ## Parallel classes and team lanes
 
@@ -77,7 +146,7 @@ npm run playwright:parallel -- \
 
 The scheduler can therefore run up to 30 team lanes at once. Classes run in parallel, teams inside a class run in parallel, and accounts inside one team remain sequential. Every active account gets a fresh Playwright `BrowserContext`; cookies and authentication state are never shared between accounts. Ledger appends from concurrent lanes are serialized per class file.
 
-All simultaneous questions enter one in-memory answer broker. The broker emits `answer_queued` for waiting prompts, activates exactly one `answer_required` prompt at a time, and accepts the answer at `ANSWER[qNNNNNN]>`. During that process only, an answer is reused for concurrent or later accounts when the complete normalized visible prompt and code produce the exact same SHA-256 fingerprint; `answer_reused` reports each reuse. Answer text is never written to disk. A failed account stops only its team lane; the other isolated teams and classes continue, and the final `parallel_result` reports partial failures.
+In manual mode, simultaneous questions enter one in-memory answer broker. The broker emits `answer_queued` for waiting prompts, activates exactly one `answer_required` prompt at a time, and accepts the answer at `ANSWER[qNNNNNN]>`. In autonomous mode, prompts go directly to the bounded GMI provider instead. In either mode, an answer is reused for concurrent or later accounts only when the complete normalized visible prompt and code produce the exact same SHA-256 fingerprint; `answer_reused` reports each reuse. Answer text is never written to disk. A failed account stops only its team lane; the other isolated teams and classes continue, and the final `parallel_result` reports partial failures.
 
 Live parallel execution deliberately requires `--yes`; omitting it fails closed. Use `--limit-per-class 1` for a small live verification, `--start-at N` to apply the same 1-based trainee offset to every selected class, or `--headed` to display the Chrome windows. Because timed sessions keep counting while a question waits in the central queue, choose concurrency that the answer producer can drain within the visible session limits.
 
@@ -95,9 +164,9 @@ npm run batch -- \
 
 The output reports selected trainees, excluded managers, teams, assigned profiles, and the actual concurrency cap. It never logs in, submits a repository, or sends an answer. `--roster` is accepted only with `--dry-run`; live execution always reads the visible portal roster.
 
-## One-time live setup
+## Advanced custom portal-adapter setup
 
-Copy the templates to ignored local files:
+The `autonomous` command does not require this adapter. Use the lower-level adapter API only when integrating a different browser-session service. Copy the templates to ignored local files:
 
 ```bash
 cp examples/realize.config.example.json realize.config.json

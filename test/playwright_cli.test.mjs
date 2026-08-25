@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { AdaptiveNetworkWaits, isIgnorableRequestFailure, isProblemHandoffUi, parseArgs, parseTraineeButtonLabel, promptFingerprint, redactApiUrl } from "../bin/realize-playwright.mjs";
+import { AdaptiveNetworkWaits, canonicalRepository, classifyHomeState, isIgnorableRequestFailure, isProblemHandoffUi, parseArgs, parseTraineeButtonLabel, promptFingerprint, redactApiUrl } from "../bin/realize-playwright.mjs";
 
 test("standalone CLI parses class and one-based resume index", () => {
   const options = parseArgs(["--class", "f", "--start-at", "3", "--limit", "1", "--headed"]);
@@ -58,4 +58,23 @@ test("handoff UI requires a real next prompt or completion, not only timer text"
   assert.equal(isProblemHandoffUi("handoff 20:00", "handoff 19:59", false), false);
   assert.equal(isProblemHandoffUi("handoff", "next prompt", true), true);
   assert.equal(isProblemHandoffUi("handoff", "이해도 확인이 끝났어요", false), true);
+});
+
+test("repository inputs are canonical and reject non-plain GitHub URLs", () => {
+  assert.deepEqual(canonicalRepository("https://www.github.com/Team-IZ/Backend.git"), {
+    url: "https://github.com/Team-IZ/Backend",
+    slug: "Team-IZ/Backend",
+    identity: "team-iz/backend",
+  });
+  assert.throws(() => canonicalRepository("http://github.com/Team-IZ/Backend"), { code: "INVALID_REPOSITORY" });
+  assert.throws(() => canonicalRepository("https://github.com/Team-IZ/Backend/issues"), { code: "INVALID_REPOSITORY" });
+});
+
+test("home state classification covers repository preparation and completed sessions", () => {
+  assert.equal(classifyHomeState("코드를 제출할 차례예요"), "submission_required");
+  assert.equal(classifyHomeState("코드 분석이 진행 중이에요"), "analyzing");
+  assert.equal(classifyHomeState("코드를 분석하지 못했어요"), "analysis_failed");
+  assert.equal(classifyHomeState("이해도 확인을 시작할 차례예요"), "ready");
+  assert.equal(classifyHomeState("이해도 확인이 진행 중이에요"), "in_progress");
+  assert.equal(classifyHomeState("다시 볼 수 있는 문제가 있어요"), "complete");
 });
