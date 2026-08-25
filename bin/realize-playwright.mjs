@@ -354,6 +354,7 @@ async function submitRepository(page, options, account, waits, repository, { all
   await page.getByText(new RegExp(`${repository.slug.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")} 확인했어요`, "iu")).waitFor({ timeout: waits.timeoutFor("repository_check") });
   if (options.repositoryBranch) await pressVerified(page.locator("#repo-branch"), options.repositoryBranch);
   const submitButton = page.getByRole("button", { name: "제출", exact: true });
+  await page.waitForFunction(() => [...document.querySelectorAll("button")].some((button) => button.textContent?.trim() === "제출" && !button.disabled), undefined, { timeout: waits.timeoutFor("repository_check") }).catch(() => {});
   if (!(await submitButton.isEnabled())) fail("REPOSITORY_SUBMIT_DISABLED", "저장소 제출 버튼이 활성화되지 않았습니다.");
   await journal(options.ledgerPath, { event: retryingAnalysis ? "team_analysis_retry_intent" : "team_submission_intent", teamName: account.teamName, accountId: account.accountId, repository: repository.identity, branch: options.repositoryBranch || null });
   const submitOutcome = await waitForApiOutcome(page, waits, {
