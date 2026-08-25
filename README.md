@@ -2,6 +2,10 @@
 
 A deterministic, resumable runner for **authorized RealiZe demo/QA accounts**. It drives an already-selected Codex Browser `Tab`; it does not import Playwright, browser-client, cookies, or credentials.
 
+## Default review repository
+
+The current default is [Team-IZ/Backend](https://github.com/Team-IZ/Backend). Import `DEFAULT_REVIEW_REPOSITORY_URL` from the runner when preparing the repository-submission step. Override it explicitly for a different authorized QA run.
+
 ## What it handles
 
 - Exact SHA-256 question fingerprints and fail-closed unknown prompts
