@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { createHash } from "node:crypto";
-import { appendFile, mkdir } from "node:fs/promises";
+import { appendFile, mkdir, readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
@@ -169,6 +169,27 @@ async function journal(path, event) {
   await current;
 }
 
+async function hasJournalEvent(path, predicate) {
+  let text;
+  try {
+    text = await readFile(path, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+  for (const [index, line] of text.split(/\n/u).entries()) {
+    if (!line.trim()) continue;
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      fail("INVALID_LEDGER_EVENT", "실행 원장의 JSON 이벤트를 읽지 못했습니다.", { path, line: index + 1 });
+    }
+    if (predicate(event)) return true;
+  }
+  return false;
+}
+
 function apiMatches(request, { method, path }) {
   if (method && request.method() !== method) return false;
   const pathname = new URL(request.url()).pathname;
@@ -303,9 +324,23 @@ async function inspectExpectedRepository(page, options, waits, repository) {
   return { state, body };
 }
 
-async function submitRepository(page, options, account, waits, repository) {
+async function submitRepository(page, options, account, waits, repository, { allowAnalysisRetry = false } = {}) {
   const body = await openSubmissionPage(page, options, waits);
-  if (submissionPageState(body) !== "draft") return inspectExpectedRepository(page, options, waits, repository);
+  const pageState = submissionPageState(body);
+  let retryingAnalysis = false;
+  if (pageState === "analysis_failed") {
+    if (!bodyContainsRepository(body, repository)) {
+      fail("REPOSITORY_MISMATCH", "분석 재시도 대상 저장소가 요청한 저장소와 다릅니다.", { expectedRepository: repository.slug, state: pageState, visibleText: body.slice(0, 1_500) });
+    }
+    if (!allowAnalysisRetry) return inspectExpectedRepository(page, options, waits, repository);
+    const retryAttempted = await hasJournalEvent(options.ledgerPath, (event) => event.teamName === account.teamName && ["team_analysis_retry_intent", "team_analysis_retry_confirmed"].includes(event.event));
+    if (retryAttempted) {
+      fail("ANALYSIS_RETRY_EXHAUSTED", "이 팀의 코드 분석 재제출은 이미 한 번 시도했습니다.", { teamName: account.teamName, repository: repository.slug });
+    }
+    retryingAnalysis = true;
+  } else if (pageState !== "draft") {
+    return inspectExpectedRepository(page, options, waits, repository);
+  }
   const input = page.locator("#repo-url");
   await input.waitFor({ state: "visible", timeout: waits.timeoutFor("home") });
   await pressVerified(input, repository.url);
@@ -320,7 +355,7 @@ async function submitRepository(page, options, account, waits, repository) {
   if (options.repositoryBranch) await pressVerified(page.locator("#repo-branch"), options.repositoryBranch);
   const submitButton = page.getByRole("button", { name: "제출", exact: true });
   if (!(await submitButton.isEnabled())) fail("REPOSITORY_SUBMIT_DISABLED", "저장소 제출 버튼이 활성화되지 않았습니다.");
-  await journal(options.ledgerPath, { event: "team_submission_intent", teamName: account.teamName, accountId: account.accountId, repository: repository.identity, branch: options.repositoryBranch || null });
+  await journal(options.ledgerPath, { event: retryingAnalysis ? "team_analysis_retry_intent" : "team_submission_intent", teamName: account.teamName, accountId: account.accountId, repository: repository.identity, branch: options.repositoryBranch || null });
   const submitOutcome = await waitForApiOutcome(page, waits, {
     category: "repository_submit",
     method: "POST",
@@ -330,9 +365,9 @@ async function submitRepository(page, options, account, waits, repository) {
   if (submitOutcome.kind !== "response" || !submitOutcome.ok) fail("REPOSITORY_SUBMIT_FAILED", "저장소 제출 응답을 확인하지 못했습니다.", { outcome: submitOutcome });
   await page.getByText(/제출됐어요|제출 완료/u).first().waitFor({ timeout: waits.timeoutFor("repository_submit") });
   const inspected = await inspectExpectedRepository(page, options, waits, repository);
-  await journal(options.ledgerPath, { event: "team_submission_submitted_unverified", teamName: account.teamName, accountId: account.accountId, repository: repository.identity });
-  emit({ event: "team_submission", className: options.className, teamName: account.teamName, accountId: account.accountId, repository: repository.slug, status: "submitted_unverified" });
-  return { ...inspected, submitted: true };
+  await journal(options.ledgerPath, { event: retryingAnalysis ? "team_analysis_retry_confirmed" : "team_submission_submitted_unverified", teamName: account.teamName, accountId: account.accountId, repository: repository.identity });
+  emit({ event: "team_submission", className: options.className, teamName: account.teamName, accountId: account.accountId, repository: repository.slug, status: retryingAnalysis ? "analysis_retry_submitted" : "submitted_unverified" });
+  return { ...inspected, submitted: true, retried: retryingAnalysis };
 }
 
 async function currentHomeState(page) {
@@ -391,7 +426,7 @@ export async function preparePlaywrightTeam({ browser, options, accounts, waits 
     const initialState = await currentHomeState(page);
     let submission;
     if (initialState === "submission_required") submission = await submitRepository(page, options, representative, waits, repository);
-    else if (initialState === "analysis_failed") fail("ANALYSIS_FAILED", "대표 계정에서 저장소 분석 실패 상태를 확인했습니다.", { teamName: representative.teamName });
+    else if (initialState === "analysis_failed") submission = await submitRepository(page, options, representative, waits, repository, { allowAnalysisRetry: true });
     else if (["analyzing", "ready", "in_progress", "complete"].includes(initialState)) submission = await inspectExpectedRepository(page, options, waits, repository);
     else if (initialState === "submission_closed") fail("SUBMISSION_CLOSED", "저장소 제출 기한이 지났습니다.", { teamName: representative.teamName });
     else fail("UNKNOWN_TEAM_STATE", "팀 대표 계정의 홈 상태를 판정하지 못했습니다.", { visibleText: (await page.locator("body").innerText()).slice(0, 1_500) });
@@ -402,7 +437,7 @@ export async function preparePlaywrightTeam({ browser, options, accounts, waits 
       const verifierPage = await verifierContext.newPage();
       await loginAs(verifierPage, options, verifier, new AdaptiveNetworkWaits());
       let verifierState = await currentHomeState(verifierPage);
-      for (let confirmationAttempt = 0; verifierState === "submission_required" && confirmationAttempt < 3; confirmationAttempt += 1) {
+      for (let confirmationAttempt = 0; (verifierState === "submission_required" || (submission.retried && verifierState === "analysis_failed")) && confirmationAttempt < 3; confirmationAttempt += 1) {
         await verifierPage.waitForTimeout(Math.min(10_000, options.analysisPollMs));
         await verifierPage.reload({ waitUntil: "domcontentloaded", timeout: waits.timeoutFor("home") });
         await waitForHome(verifierPage, verifier.displayName, waits);
