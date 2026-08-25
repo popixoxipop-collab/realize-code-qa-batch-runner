@@ -335,11 +335,15 @@ test("grading wait learns from observed fake-tab latency and reaches completion"
     },
   });
   const before = waitStats.timeoutFor("grading");
+  const generated = [];
   const runner = createRealizeBatchRunner({
     tab: new FakeTab(locators),
     selectors,
     expectedAccount: "F반 1팀 교육생 02",
-    answerBank: [{ prompt, answer: "먼저 키워드 조건을 확인하고 검색 결과를 반환합니다." }],
+    answerProvider: async (request) => {
+      generated.push(request);
+      return "먼저 키워드 조건을 확인하고 검색 결과를 반환합니다.";
+    },
     checkpoints: {
       writeAhead: async (record) => checkpoints.push(record),
       confirmed: async (record) => checkpoints.push(record),
@@ -350,6 +354,8 @@ test("grading wait learns from observed fake-tab latency and reaches completion"
   });
   const result = await runner.runAccount();
   assert.equal(result.status, "complete");
+  assert.equal(generated.length, 1);
+  assert.equal(generated[0].fingerprint, fingerprintQuestion(prompt));
   assert.ok(waitStats.snapshot("grading").p95Ms >= 900);
   assert.ok(waitStats.timeoutFor("grading") > before);
   assert.deepEqual(checkpoints.filter((record) => record.action === "answer_submit").map((record) => record.phase), ["intent", "confirmed"]);

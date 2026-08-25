@@ -32,7 +32,25 @@ npm test
 npm run check
 ```
 
-The package has no runtime dependency. Tests use Node's built-in test runner.
+The deterministic core uses Node's built-in test runner. The standalone browser command uses `playwright-core` with an existing local Chrome installation; it does not download or bundle a browser.
+
+## Standalone Chrome run with live-generated answers
+
+The fixed Playwright command reproduces the verified UI sequence without requiring an interactive browser-control agent for routine clicks and waits:
+
+```bash
+npm run playwright:class -- --class F --start-at 3
+```
+
+`--start-at` is a 1-based index in the visible trainee order after the manager is excluded. For example, `--start-at 3` skips the first two F-class trainees and resumes with the third. Add `--limit 1` for a one-account verification run or `--headed` to keep Chrome visible.
+
+The command discovers the visible roster, uses a fresh isolated Chrome context for each account, verifies the account banner, and automates session start, code-point handoff, real-key answer entry, submit, grading waits, and completion detection. It writes only hashes and state transitions to `runs/playwright-<class>.ndjson`; credentials and answer text are never persisted.
+
+Waiting is driven by the same API responses visible in Chrome DevTools Network rather than by long fixed DOM sleeps. The runner measures response latency by category, keeps an EWMA and recent p95, and adapts the next timeout and retry delay. Answer submission initially allows up to four minutes because grading can be slow; an explicit HTTP failure keeps the existing textarea value and retries only the same submit. Three consecutive answer-API failures stop that account with its session preserved instead of starting another trainee.
+
+When the current question appears, the process emits one JSON object with `event: "answer_required"`, the visible question/code text, and an exact fingerprint, then waits at `ANSWER>`. Generate a fresh 3–5 sentence answer from that visible prompt and the pinned repository source, enter it once, and let the script continue. This is the intended direct-answer mode; no repository-specific answer bank is loaded or published.
+
+The standalone command intentionally stops if an account is not already at the understanding-session stage. Repository submission and analysis orchestration remain behind the stricter portal-adapter workflow below so an unfinished or ambiguous team submission is never replayed automatically.
 
 ## Preview a class plan without browser side effects
 

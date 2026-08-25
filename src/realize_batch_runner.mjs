@@ -348,6 +348,11 @@ function validateRunnerOptions(options) {
   assert(options.expectedAccount, "MISSING_ACCOUNT", "expectedAccount is required for fail-closed account verification.");
   assert(options.checkpoints?.writeAhead instanceof Function, "MISSING_CHECKPOINT", "checkpoints.writeAhead callback is required.");
   assert(options.checkpoints?.confirmed instanceof Function, "MISSING_CHECKPOINT", "checkpoints.confirmed callback is required.");
+  assert(
+    options.answerProvider instanceof Function || options.answerBank,
+    "MISSING_ANSWER_SOURCE",
+    "answerBank or answerProvider is required.",
+  );
   const requiredSelectors = ["accountBanner", "question", "textarea", "submitButton", "grading", "reExplain", "handoff", "handoffButton", "completion"];
   for (const name of requiredSelectors) assert(options.selectors?.[name], "MISSING_SELECTOR", `selectors.${name} is required.`);
 }
@@ -358,7 +363,7 @@ export function createRealizeBatchRunner(options) {
   const selectors = options.selectors;
   const labels = { ...DEFAULT_LABELS, ...(options.labels ?? {}) };
   const waitStats = options.waitStats ?? new AdaptiveWaitStats(options.waitConfig);
-  const compiledBank = compileAnswerBank(options.answerBank);
+  const compiledBank = options.answerBank ? compileAnswerBank(options.answerBank) : null;
   const clock = options.clock ?? defaultClock;
   const sleep = options.sleep ?? defaultSleep;
   const maxTypingRetries = options.maxTypingRetries ?? 3;
@@ -526,7 +531,23 @@ export function createRealizeBatchRunner(options) {
       attempt,
       confirmed: confirmed.has(attemptKey),
     });
-    const selected = resolveAnswer(compiledBank, prompt, attempt);
+    const selected = options.answerProvider
+      ? await (async () => {
+          const provided = await options.answerProvider({
+            prompt: canonicalQuestion(prompt),
+            fingerprint,
+            attempt,
+          });
+          const answer = typeof provided === "string" ? provided : provided?.answer;
+          assert(
+            typeof answer === "string" && normalizeTextarea(answer).length > 0,
+            "EMPTY_ANSWER",
+            "answerProvider returned an empty answer.",
+            { fingerprint, attempt },
+          );
+          return { answer: normalizeTextarea(answer), attempt, fingerprint, entry: null };
+        })()
+      : resolveAnswer(compiledBank, prompt, attempt);
     const textarea = locatorFor(tab, selectors.textarea);
     const typing = await typeVerified({
       locator: textarea,

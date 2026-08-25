@@ -5,7 +5,8 @@
   "type": "module",
   "private": false,
   "bin": {
-    "realize-batch": "bin/realize-batch.mjs"
+    "realize-batch": "bin/realize-batch.mjs",
+    "realize-playwright": "bin/realize-playwright.mjs"
   },
   "files": [
     "bin",
@@ -16,12 +17,16 @@
   ],
   "scripts": {
     "batch": "node bin/realize-batch.mjs",
+    "playwright:class": "node bin/realize-playwright.mjs",
     "test": "node --test test/*.test.mjs",
     "test:runner": "node --test test/realize_batch_runner.test.mjs",
-    "check": "node --check bin/realize-batch.mjs"
+    "check": "node --check bin/realize-batch.mjs && node --check bin/realize-playwright.mjs"
   },
   "engines": {
     "node": ">=20"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "playwright-core": "^1.62.1"
+  }
 }
