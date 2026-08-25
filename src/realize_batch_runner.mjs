@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 
+export const DEFAULT_REVIEW_REPOSITORY_URL = "https://github.com/Team-IZ/Backend";
+
 export const DEFAULT_LABELS = Object.freeze({
   answerSubmit: "답변 제출",
   finalSubmit: "답변 제출하고 마치기",
@@ -586,4 +588,3 @@ export function createRealizeBatchRunner(options) {
     }),
   });
 }
-
