@@ -324,7 +324,7 @@ async function inspectExpectedRepository(page, options, waits, repository) {
   return { state, body };
 }
 
-async function submitRepository(page, options, account, waits, repository, { allowAnalysisRetry = false } = {}) {
+async function submitRepository(page, options, account, waits, repository, { allowAnalysisRetry = false, forceAnalysisRetry = false } = {}) {
   const body = await openSubmissionPage(page, options, waits);
   const pageState = submissionPageState(body);
   let retryingAnalysis = false;
@@ -333,6 +333,13 @@ async function submitRepository(page, options, account, waits, repository, { all
       fail("REPOSITORY_MISMATCH", "분석 재시도 대상 저장소가 요청한 저장소와 다릅니다.", { expectedRepository: repository.slug, state: pageState, visibleText: body.slice(0, 1_500) });
     }
     if (!allowAnalysisRetry) return inspectExpectedRepository(page, options, waits, repository);
+    const retryAttempted = await hasJournalEvent(options.ledgerPath, (event) => event.teamName === account.teamName && ["team_analysis_retry_intent", "team_analysis_retry_confirmed"].includes(event.event));
+    if (retryAttempted) {
+      fail("ANALYSIS_RETRY_EXHAUSTED", "이 팀의 코드 분석 재제출은 이미 한 번 시도했습니다.", { teamName: account.teamName, repository: repository.slug });
+    }
+    retryingAnalysis = true;
+  } else if (pageState === "draft" && forceAnalysisRetry) {
+    if (!allowAnalysisRetry) fail("ANALYSIS_RETRY_NOT_ALLOWED", "분석 재제출 허용 상태가 아닙니다.", { teamName: account.teamName });
     const retryAttempted = await hasJournalEvent(options.ledgerPath, (event) => event.teamName === account.teamName && ["team_analysis_retry_intent", "team_analysis_retry_confirmed"].includes(event.event));
     if (retryAttempted) {
       fail("ANALYSIS_RETRY_EXHAUSTED", "이 팀의 코드 분석 재제출은 이미 한 번 시도했습니다.", { teamName: account.teamName, repository: repository.slug });
@@ -426,7 +433,10 @@ export async function preparePlaywrightTeam({ browser, options, accounts, waits 
     await loginAs(page, options, representative, waits);
     const initialState = await currentHomeState(page);
     let submission;
-    if (initialState === "submission_required") submission = await submitRepository(page, options, representative, waits, repository);
+    if (initialState === "submission_required") {
+      const previouslyConfirmed = await hasJournalEvent(options.ledgerPath, (event) => event.event === "team_submission_confirmed" && event.teamName === representative.teamName && event.repository === repository.identity);
+      submission = await submitRepository(page, options, representative, waits, repository, { allowAnalysisRetry: previouslyConfirmed, forceAnalysisRetry: previouslyConfirmed });
+    }
     else if (initialState === "analysis_failed") submission = await submitRepository(page, options, representative, waits, repository, { allowAnalysisRetry: true });
     else if (["analyzing", "ready", "in_progress", "complete"].includes(initialState)) submission = await inspectExpectedRepository(page, options, waits, repository);
     else if (initialState === "submission_closed") fail("SUBMISSION_CLOSED", "저장소 제출 기한이 지났습니다.", { teamName: representative.teamName });
