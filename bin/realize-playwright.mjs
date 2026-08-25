@@ -214,11 +214,19 @@ async function pressVerified(textarea, answer) {
   }
 }
 
+export function promptFingerprint(visibleText, code) {
+  const stableText = visibleText
+    .replace(/이 문제 \d{2}:\d{2}:\d{2} 남음/gu, "이 문제 <time> 남음")
+    .replace(/^\d+자$/gmu, "<characters>")
+    .replace(/^\d+번 남음$/gmu, "<retries>");
+  return `sha256:${createHash("sha256").update(JSON.stringify({ visibleText: stableText, code })).digest("hex")}`;
+}
+
 async function capturePrompt(page) {
   const main = page.locator("main");
   const visibleText = ((await main.count()) ? await main.innerText() : await page.locator("body").innerText()).trim();
   const code = await page.locator("pre, code").allTextContents();
-  const fingerprint = `sha256:${createHash("sha256").update(JSON.stringify({ visibleText, code })).digest("hex")}`;
+  const fingerprint = promptFingerprint(visibleText, code);
   return { visibleText, code, fingerprint };
 }
 
@@ -240,6 +248,28 @@ async function askForAnswer(reader, account, page, attempt) {
 async function waitForRenderedState(page, previousText, waits, category) {
   const timeout = Math.min(60_000, Math.max(5_000, waits.timeoutFor(category) / 3));
   await page.waitForFunction((before) => document.body.innerText !== before, previousText, { timeout });
+}
+
+async function reconcileAnswerAfterFailure(page, waits, fingerprint) {
+  const delayMs = waits.retryDelayFor("answer");
+  emit({ event: "answer_reconcile_wait", delayMs });
+  await page.waitForTimeout(delayMs);
+  const outcome = await waitForApiOutcome(page, waits, {
+    category: "session",
+    method: "GET",
+    path: /\/api\/v0\/assessment-sessions\/(?:current|[^/]+(?:\/problems\/\d+)?)$/u,
+    action: () => page.reload({ waitUntil: "domcontentloaded", timeout: waits.timeoutFor("session") }),
+  });
+  if (outcome.kind !== "response" || !outcome.ok) {
+    fail("ANSWER_RECONCILE_NETWORK_FAILED", "답변 실패 후 세션 상태를 재조회하지 못했습니다.", { outcome });
+  }
+  await page.waitForTimeout(500);
+  const body = await page.locator("body").innerText();
+  if (body.includes("끝났어요") || body.includes("채점하는 중")) return { reflected: true, state: "advanced" };
+  const textarea = page.locator("textarea:visible").first();
+  if (!(await textarea.isVisible().catch(() => false))) return { reflected: true, state: "advanced" };
+  const current = await capturePrompt(page);
+  return { reflected: current.fingerprint !== fingerprint, state: current.fingerprint === fingerprint ? "same_prompt" : "next_prompt" };
 }
 
 async function runAssessment(page, reader, options, account, waits) {
@@ -319,11 +349,19 @@ async function runAssessment(page, reader, options, account, waits) {
       });
       if (outcome.kind !== "response" || !outcome.ok) {
         consecutiveAnswerFailures += 1;
+        const reconciliation = await reconcileAnswerAfterFailure(page, waits, fingerprint);
+        if (reconciliation.reflected) {
+          await journal(options.ledgerPath, { event: "answer_submit_reconciled", accountId: account.accountId, teamName: account.teamName, fingerprint, attempt, outcome });
+          emit({ event: "answer_reconciled", accountId: account.accountId, fingerprint, attempt, outcome, state: reconciliation.state });
+          consecutiveAnswerFailures = 0;
+          pendingAnswer = null;
+          attempt += 1;
+          continue;
+        }
         if (consecutiveAnswerFailures >= 3) {
           fail("ANSWER_API_REPEATED_FAILURE", "답변 API가 연속 3회 실패해 현재 계정을 보존한 채 중단합니다.", { outcome, adaptive: waits.snapshot("answer") });
         }
-        emit({ event: "answer_retry", accountId: account.accountId, fingerprint, attempt, delayMs: waits.retryDelayFor("answer"), outcome });
-        await page.waitForTimeout(waits.retryDelayFor("answer"));
+        emit({ event: "answer_retry", accountId: account.accountId, fingerprint, attempt, delayMs: 0, outcome, reconciledState: reconciliation.state });
         continue;
       }
       await waitForRenderedState(page, before, waits, "answer").catch(() => {});

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { AdaptiveNetworkWaits, parseArgs, parseTraineeButtonLabel, redactApiUrl } from "../bin/realize-playwright.mjs";
+import { AdaptiveNetworkWaits, parseArgs, parseTraineeButtonLabel, promptFingerprint, redactApiUrl } from "../bin/realize-playwright.mjs";
 
 test("standalone CLI parses class and one-based resume index", () => {
   const options = parseArgs(["--class", "f", "--start-at", "3", "--limit", "1", "--headed"]);
@@ -40,4 +40,11 @@ test("network logs redact session identifiers and query parameters", () => {
     redactApiUrl("https://example.com/api/v0/assessment-sessions/c2a9bbe5-f55f-4f2d-9217-7093483e06c3/answers?debug=true"),
     "https://example.com/api/v0/assessment-sessions/:sessionId/answers",
   );
+});
+
+test("prompt fingerprints ignore countdown and retry counters", () => {
+  const first = promptFingerprint("문제\n이 문제 00:20:00 남음\n0자\n2번 남음", ["code"]);
+  const later = promptFingerprint("문제\n이 문제 00:18:08 남음\n143자\n1번 남음", ["code"]);
+  assert.equal(first, later);
+  assert.notEqual(first, promptFingerprint("다른 문제\n이 문제 00:20:00 남음\n0자\n2번 남음", ["code"]));
 });
