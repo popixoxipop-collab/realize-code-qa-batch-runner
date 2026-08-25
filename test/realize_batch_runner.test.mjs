@@ -7,7 +7,7 @@ import {
   createRealizeBatchRunner,
   fingerprintQuestion,
   typeVerified,
-} from "./realize_batch_runner.mjs";
+} from "../src/realize_batch_runner.mjs";
 
 class FakeTextarea {
   constructor({ corruptFirstChunk = false, clock = null } = {}) {
