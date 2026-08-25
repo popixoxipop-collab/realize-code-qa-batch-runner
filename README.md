@@ -7,6 +7,7 @@ The current default review repository is [Team-IZ/Backend](https://github.com/Te
 ## What is included
 
 - Interactive class selection or `--class F`
+- Multi-class Playwright scheduling with bounded class and team concurrency
 - Live-roster adapter contract; no hard-coded real account list
 - Exact `role=교육생` filtering and manager exclusion
 - One parallel lane per team, with accounts sequential inside each team
@@ -51,6 +52,34 @@ Waiting is driven by the same API responses visible in Chrome DevTools Network r
 When the current question appears, the process emits one JSON object with `event: "answer_required"`, the visible question/code text, and an exact fingerprint, then waits at `ANSWER>`. Generate a fresh 3–5 sentence answer from that visible prompt and the pinned repository source, enter it once, and let the script continue. This is the intended direct-answer mode; no repository-specific answer bank is loaded or published.
 
 The standalone command intentionally stops if an account is not already at the understanding-session stage. Repository submission and analysis orchestration remain behind the stricter portal-adapter workflow below so an unfinished or ambiguous team submission is never replayed automatically.
+
+## Parallel classes and team lanes
+
+Preview all six classes without starting or resuming an assessment:
+
+```bash
+npm run playwright:parallel -- \
+  --classes A,B,C,D,E,F \
+  --class-concurrency 6 \
+  --team-concurrency 5 \
+  --dry-run
+```
+
+After reviewing the visible-roster plans, start the live run explicitly:
+
+```bash
+npm run playwright:parallel -- \
+  --classes A,B,C,D,E,F \
+  --class-concurrency 6 \
+  --team-concurrency 5 \
+  --yes
+```
+
+The scheduler can therefore run up to 30 team lanes at once. Classes run in parallel, teams inside a class run in parallel, and accounts inside one team remain sequential. Every active account gets a fresh Playwright `BrowserContext`; cookies and authentication state are never shared between accounts. Ledger appends from concurrent lanes are serialized per class file.
+
+All simultaneous questions enter one in-memory answer broker. The broker emits `answer_queued` for waiting prompts, activates exactly one `answer_required` prompt at a time, and accepts the answer at `ANSWER[qNNNNNN]>`. Answer text is never written to disk. A failed account stops only its team lane; the other isolated teams and classes continue, and the final `parallel_result` reports partial failures.
+
+Live parallel execution deliberately requires `--yes`; omitting it fails closed. Use `--limit-per-class 1` for a small live verification, `--start-at N` to apply the same 1-based trainee offset to every selected class, or `--headed` to display the Chrome windows. Because timed sessions keep counting while a question waits in the central queue, choose concurrency that the answer producer can drain within the visible session limits.
 
 ## Preview a class plan without browser side effects
 

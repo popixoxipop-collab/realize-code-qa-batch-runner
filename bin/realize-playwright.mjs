@@ -8,6 +8,8 @@ import { stdin, stdout } from "node:process";
 
 import { chromium } from "playwright-core";
 
+import { groupAccountsByTeam, runTeamLanes } from "../src/parallel_scheduler.mjs";
+
 const DEFAULT_BASE_URL = "https://frontend-eight-neon-73.vercel.app";
 const DEFAULT_CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 
@@ -107,13 +109,20 @@ export function parseTraineeButtonLabel(label, className) {
   });
 }
 
-function emit(event) {
+export function emit(event) {
   stdout.write(`${JSON.stringify({ at: new Date().toISOString(), ...event })}\n`);
 }
 
+const journalTails = new Map();
+
 async function journal(path, event) {
-  await mkdir(dirname(path), { recursive: true });
-  await appendFile(path, `${JSON.stringify({ at: new Date().toISOString(), ...event })}\n`, { encoding: "utf8", mode: 0o600 });
+  const previous = journalTails.get(path) ?? Promise.resolve();
+  const current = previous.then(async () => {
+    await mkdir(dirname(path), { recursive: true });
+    await appendFile(path, `${JSON.stringify({ at: new Date().toISOString(), ...event })}\n`, { encoding: "utf8", mode: 0o600 });
+  });
+  journalTails.set(path, current.catch(() => {}));
+  await current;
 }
 
 function apiMatches(request, { method, path }) {
@@ -174,7 +183,7 @@ async function waitForHome(page, expectedName, waits) {
 async function loginAs(page, options, account, waits) {
   await page.goto(`${options.baseUrl}/shared/login`, { waitUntil: "domcontentloaded", timeout: 30_000 });
   await page.getByRole("button", { name: /케이스별 계정/u }).click();
-  await page.getByRole("button", { name: `${options.className}26`, exact: true }).click();
+  await page.getByRole("button", { name: new RegExp(`^${options.className}\\d+$`, "u") }).click();
   const accountPrefix = `${options.className} ${account.teamName} ${account.displayName}`;
   const outcome = await waitForApiOutcome(page, waits, {
     category: "home",
@@ -186,7 +195,7 @@ async function loginAs(page, options, account, waits) {
   await waitForHome(page, account.displayName, waits);
 }
 
-async function discoverRoster(browser, options) {
+export async function discoverRoster(browser, options) {
   const context = await browser.newContext();
   try {
     const page = await context.newPage();
@@ -234,17 +243,15 @@ async function capturePrompt(page) {
   return { visibleText, code, fingerprint };
 }
 
-async function askForAnswer(reader, account, page, attempt) {
+async function askForAnswer(answerProvider, account, page, attempt) {
   const { visibleText, code, fingerprint } = await capturePrompt(page);
-  emit({
-    event: "answer_required",
-    account: { teamName: account.teamName, displayName: account.displayName, accountId: account.accountId },
+  const answer = String(await answerProvider({
+    account: { className: account.className, teamName: account.teamName, displayName: account.displayName, accountId: account.accountId },
     attempt,
     fingerprint,
     visibleText,
     code,
-  });
-  const answer = (await reader.question("ANSWER> ")).normalize("NFC").trim();
+  })).normalize("NFC").trim();
   if (!answer) fail("EMPTY_ANSWER", "답변이 비어 있습니다.");
   return { answer, fingerprint };
 }
@@ -276,7 +283,7 @@ async function reconcileAnswerAfterFailure(page, waits, fingerprint) {
   return { reflected: current.fingerprint !== fingerprint, state: current.fingerprint === fingerprint ? "same_prompt" : "next_prompt" };
 }
 
-async function runAssessment(page, reader, options, account, waits) {
+async function runAssessment(page, answerProvider, options, account, waits) {
   let body = await page.locator("body").innerText();
   if (body.includes("이해도 확인이 끝났어요")) return { status: "complete", skipped: true };
   const continuing = body.includes("이해도 확인이 진행 중이에요");
@@ -336,7 +343,7 @@ async function runAssessment(page, reader, options, account, waits) {
     }
     const textarea = page.locator("textarea:visible").first();
     if (await textarea.isVisible().catch(() => false)) {
-      if (!pendingAnswer) pendingAnswer = await askForAnswer(reader, account, page, attempt);
+      if (!pendingAnswer) pendingAnswer = await askForAnswer(answerProvider, account, page, attempt);
       const { answer, fingerprint } = pendingAnswer;
       if ((await textarea.inputValue()).normalize("NFC") !== answer.normalize("NFC")) await pressVerified(textarea, answer);
       const submit = page.getByRole("button", { name: /^(답변 제출|답변 제출하고 마치기)$/u }).first();
@@ -396,6 +403,71 @@ async function runAssessment(page, reader, options, account, waits) {
   fail("STEP_LIMIT", "세션 단계 제한을 초과했습니다.");
 }
 
+export async function runPlaywrightAccount({ browser, options, account, answerProvider, waits = new AdaptiveNetworkWaits() }) {
+  const context = await browser.newContext();
+  try {
+    const page = await context.newPage();
+    emit({ event: "account_start", className: options.className, teamName: account.teamName, displayName: account.displayName, accountId: account.accountId });
+    await loginAs(page, options, account, waits);
+    const result = await runAssessment(page, answerProvider, options, account, waits);
+    emit({ event: "account_result", className: options.className, teamName: account.teamName, displayName: account.displayName, accountId: account.accountId, ...result });
+    return { accountId: account.accountId, teamName: account.teamName, ...result };
+  } finally {
+    await context.close();
+  }
+}
+
+export async function runPlaywrightClass({ browser, options, answerProvider, teamConcurrency = 1, dryRun = false }) {
+  if (!Number.isInteger(teamConcurrency) || teamConcurrency < 1) fail("INVALID_TEAM_CONCURRENCY", "teamConcurrency must be a positive integer.");
+  const roster = await discoverRoster(browser, options);
+  const selected = roster
+    .slice(options.startAt - 1, options.startAt - 1 + options.limit)
+    .map((account) => ({ ...account, className: options.className }));
+  if (selected.length === 0) fail("EMPTY_SELECTION", "선택 범위에 교육생 계정이 없습니다.", { className: options.className, startAt: options.startAt });
+  const groups = groupAccountsByTeam(selected);
+  emit({
+    event: "plan",
+    className: options.className,
+    rosterCount: roster.length,
+    selectedCount: selected.length,
+    teamCount: groups.length,
+    teamConcurrency: Math.min(teamConcurrency, groups.length),
+    startAt: options.startAt,
+    dryRun,
+    selected: selected.map(({ teamName, displayName, accountId }) => ({ teamName, displayName, accountId })),
+  });
+  if (dryRun) return { className: options.className, status: "planned", rosterCount: roster.length, selectedCount: selected.length, teamCount: groups.length, failedTeams: 0 };
+
+  const results = await runTeamLanes({
+    groups,
+    concurrency: teamConcurrency,
+    runAccount: async (account) => runPlaywrightAccount({ browser, options, account, answerProvider, waits: new AdaptiveNetworkWaits() }),
+  });
+  for (const result of results) {
+    if (result.status === "failed") {
+      emit({
+        event: "team_failed",
+        className: options.className,
+        teamName: result.teamName,
+        accountId: result.failedAccount.accountId,
+        code: result.error?.code ?? "PLAYWRIGHT_TEAM_FAILED",
+        message: result.error?.message ?? String(result.error),
+      });
+    }
+  }
+  const summary = {
+    className: options.className,
+    status: results.some((result) => result.status === "failed") ? "partial" : "complete",
+    rosterCount: roster.length,
+    selectedCount: selected.length,
+    teamCount: groups.length,
+    completedAccounts: results.reduce((count, result) => count + result.completed.length, 0),
+    failedTeams: results.filter((result) => result.status === "failed").length,
+  };
+  emit({ event: "class_result", ...summary });
+  return summary;
+}
+
 async function main(argv) {
   const options = parseArgs(argv);
   if (options.help) {
@@ -404,23 +476,13 @@ async function main(argv) {
   }
   const browser = await chromium.launch({ headless: options.headless, executablePath: options.chromePath });
   const reader = createInterface({ input: stdin, output: stdout });
-  const waits = new AdaptiveNetworkWaits();
+  const answerProvider = async (payload) => {
+    emit({ event: "answer_required", ...payload });
+    return reader.question("ANSWER> ");
+  };
   try {
-    const roster = await discoverRoster(browser, options);
-    const selected = roster.slice(options.startAt - 1, options.startAt - 1 + options.limit);
-    emit({ event: "plan", className: options.className, rosterCount: roster.length, startAt: options.startAt, selected: selected.map(({ teamName, displayName, accountId }) => ({ teamName, displayName, accountId })) });
-    for (const account of selected) {
-      const context = await browser.newContext();
-      try {
-        const page = await context.newPage();
-        emit({ event: "account_start", teamName: account.teamName, displayName: account.displayName, accountId: account.accountId });
-        await loginAs(page, options, account, waits);
-        const result = await runAssessment(page, reader, options, account, waits);
-        emit({ event: "account_result", teamName: account.teamName, displayName: account.displayName, accountId: account.accountId, ...result });
-      } finally {
-        await context.close();
-      }
-    }
+    const result = await runPlaywrightClass({ browser, options, answerProvider, teamConcurrency: 1 });
+    if (result.failedTeams > 0) fail("PLAYWRIGHT_CLASS_PARTIAL", "하나 이상의 팀 lane이 실패했습니다.", { summary: result });
   } finally {
     reader.close();
     await browser.close();

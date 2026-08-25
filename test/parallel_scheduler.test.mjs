@@ -1,0 +1,110 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import { parseParallelArgs } from "../bin/realize-playwright-parallel.mjs";
+import { groupAccountsByTeam, mapConcurrent, normalizeClassList, runTeamLanes, SerialAnswerBroker } from "../src/parallel_scheduler.mjs";
+
+const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+test("parallel CLI requires explicit classes and live confirmation", () => {
+  const preview = parseParallelArgs(["--classes", "a,b,f", "--class-concurrency", "2", "--team-concurrency", "5", "--dry-run"]);
+  assert.deepEqual(preview.classes, ["A반", "B반", "F반"]);
+  assert.equal(preview.classConcurrency, 2);
+  assert.equal(preview.teamConcurrency, 5);
+  assert.equal(preview.dryRun, true);
+  assert.throws(() => parseParallelArgs(["--classes", "A,B"]), { code: "LIVE_CONFIRMATION_REQUIRED" });
+  assert.throws(() => parseParallelArgs(["--classes", "A,A", "--dry-run"]), { code: "DUPLICATE_CLASS" });
+});
+
+test("bounded scheduler never exceeds configured concurrency", async () => {
+  let active = 0;
+  let maximum = 0;
+  const results = await mapConcurrent([1, 2, 3, 4, 5, 6], 3, async (value) => {
+    active += 1;
+    maximum = Math.max(maximum, active);
+    await tick();
+    active -= 1;
+    return value * 2;
+  });
+  assert.equal(maximum, 3);
+  assert.deepEqual(results, [2, 4, 6, 8, 10, 12]);
+});
+
+test("team lanes are parallel while accounts in each team stay sequential", async () => {
+  const groups = groupAccountsByTeam([
+    { accountId: "a1", teamName: "1팀" },
+    { accountId: "a2", teamName: "1팀" },
+    { accountId: "b1", teamName: "2팀" },
+    { accountId: "b2", teamName: "2팀" },
+  ]);
+  const activeByTeam = new Map();
+  let active = 0;
+  let maximum = 0;
+  const results = await runTeamLanes({
+    groups,
+    concurrency: 2,
+    runAccount: async (account) => {
+      assert.equal(activeByTeam.get(account.teamName) ?? 0, 0);
+      activeByTeam.set(account.teamName, 1);
+      active += 1;
+      maximum = Math.max(maximum, active);
+      await tick();
+      active -= 1;
+      activeByTeam.set(account.teamName, 0);
+      return account.accountId;
+    },
+  });
+  assert.equal(maximum, 2);
+  assert.deepEqual(results.map((result) => result.completed), [["a1", "a2"], ["b1", "b2"]]);
+});
+
+test("a failed account stops only its team lane", async () => {
+  const groups = groupAccountsByTeam([
+    { accountId: "a1", teamName: "1팀" },
+    { accountId: "a2", teamName: "1팀" },
+    { accountId: "b1", teamName: "2팀" },
+    { accountId: "b2", teamName: "2팀" },
+  ]);
+  const visited = [];
+  const results = await runTeamLanes({
+    groups,
+    concurrency: 2,
+    runAccount: async (account) => {
+      visited.push(account.accountId);
+      if (account.accountId === "a1") throw Object.assign(new Error("stop"), { code: "TEST_STOP" });
+      return account.accountId;
+    },
+  });
+  assert.equal(results[0].status, "failed");
+  assert.equal(results[1].status, "complete");
+  assert.equal(visited.includes("a2"), false);
+  assert.equal(visited.includes("b2"), true);
+});
+
+test("central answer broker serializes concurrent questions", async () => {
+  const active = [];
+  const queued = [];
+  let inAsk = 0;
+  let maximum = 0;
+  const broker = new SerialAnswerBroker({
+    onQueued: ({ requestId }) => queued.push(requestId),
+    onActive: ({ requestId }) => active.push(requestId),
+    ask: async ({ requestId }) => {
+      inAsk += 1;
+      maximum = Math.max(maximum, inAsk);
+      await tick();
+      inAsk -= 1;
+      return `answer-${requestId}`;
+    },
+  });
+  const answers = await Promise.all([broker.request({}), broker.request({}), broker.request({})]);
+  assert.equal(maximum, 1);
+  assert.deepEqual(queued, ["q000001", "q000002", "q000003"]);
+  assert.deepEqual(active, queued);
+  assert.deepEqual(answers, queued.map((requestId) => `answer-${requestId}`));
+});
+
+test("class list normalization is strict", () => {
+  assert.deepEqual(normalizeClassList("a,B반,f"), ["A반", "B반", "F반"]);
+  assert.throws(() => normalizeClassList("A,1"), { code: "INVALID_CLASSES" });
+});
