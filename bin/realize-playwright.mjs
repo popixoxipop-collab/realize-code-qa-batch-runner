@@ -181,18 +181,34 @@ async function waitForHome(page, expectedName, waits) {
 }
 
 async function loginAs(page, options, account, waits) {
-  await page.goto(`${options.baseUrl}/shared/login`, { waitUntil: "domcontentloaded", timeout: 30_000 });
-  await page.getByRole("button", { name: /케이스별 계정/u }).click();
-  await page.getByRole("button", { name: new RegExp(`^${options.className}\\d+$`, "u") }).click();
   const accountPrefix = `${options.className} ${account.teamName} ${account.displayName}`;
-  const outcome = await waitForApiOutcome(page, waits, {
-    category: "home",
-    method: "GET",
-    path: "/api/v0/assessment-rounds",
-    action: () => page.getByRole("button", { name: new RegExp(`^${accountPrefix.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}`, "u") }).click(),
-  });
-  if (outcome.kind !== "response" || !outcome.ok) fail("LOGIN_NETWORK_FAILED", "로그인 뒤 회차 정보를 받지 못했습니다.", { outcome });
-  await waitForHome(page, account.displayName, waits);
+  let lastOutcome;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await page.goto(`${options.baseUrl}/shared/login`, { waitUntil: "domcontentloaded", timeout: waits.timeoutFor("home") });
+    await page.getByRole("button", { name: /케이스별 계정/u }).click();
+    await page.getByRole("button", { name: new RegExp(`^${options.className}\\d+$`, "u") }).click();
+    lastOutcome = await waitForApiOutcome(page, waits, {
+      category: "home",
+      method: "GET",
+      path: "/api/v0/assessment-rounds",
+      action: () => page.getByRole("button", { name: new RegExp(`^${accountPrefix.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}`, "u") }).click(),
+    });
+    if (lastOutcome.kind === "response" && lastOutcome.ok) {
+      await waitForHome(page, account.displayName, waits);
+      return;
+    }
+    const reconciled = await waitForHome(page, account.displayName, waits).then(() => true).catch(() => false);
+    if (reconciled) {
+      emit({ event: "login_reconciled", className: options.className, teamName: account.teamName, accountId: account.accountId, attempt });
+      return;
+    }
+    if (attempt < 2) {
+      const delayMs = waits.retryDelayFor("home");
+      emit({ event: "login_retry", className: options.className, teamName: account.teamName, accountId: account.accountId, attempt: attempt + 1, delayMs, outcome: lastOutcome });
+      await page.waitForTimeout(delayMs);
+    }
+  }
+  fail("LOGIN_NETWORK_FAILED", "로그인 뒤 회차 정보를 받지 못했습니다.", { outcome: lastOutcome, adaptive: waits.snapshot("home") });
 }
 
 export async function discoverRoster(browser, options) {
@@ -261,6 +277,42 @@ async function waitForRenderedState(page, previousText, waits, category) {
   await page.waitForFunction((before) => document.body.innerText !== before, previousText, { timeout });
 }
 
+export function isProblemHandoffUi(previousText, currentText, hasVisibleTextarea) {
+  return currentText !== previousText && (hasVisibleTextarea || currentText.includes("끝났어요"));
+}
+
+async function waitForProblemHandoff(page, waits, handoff, previousText) {
+  const timeoutMs = waits.timeoutFor("problem");
+  const startedAt = Date.now();
+  let timeoutHandle;
+  const response = page.waitForResponse((candidate) => apiMatches(candidate.request(), {
+    method: "GET",
+    path: /\/api\/v0\/assessment-sessions\/(?:current|[^/]+(?:\/problems\/\d+)?)$/u,
+  }), { timeout: timeoutMs }).then(async (candidate) => {
+    await candidate.finished().catch(() => {});
+    return { kind: "response", status: candidate.status(), ok: candidate.ok(), url: redactApiUrl(candidate.url()) };
+  }).catch(() => new Promise(() => {}));
+  const ui = page.waitForFunction((before) => {
+    const current = document.body.innerText;
+    const textarea = [...document.querySelectorAll("textarea")].some((element) => {
+      const style = window.getComputedStyle(element);
+      return style.visibility !== "hidden" && style.display !== "none";
+    });
+    return current !== before && (textarea || current.includes("끝났어요"));
+  }, previousText, { timeout: timeoutMs }).then(() => ({ kind: "ui_transition", ok: true })).catch(() => new Promise(() => {}));
+  const timedOut = new Promise((resolveTimeout) => {
+    timeoutHandle = setTimeout(() => resolveTimeout({ kind: "timeout" }), timeoutMs);
+  });
+  await handoff.click();
+  const outcome = await Promise.race([response, ui, timedOut]);
+  clearTimeout(timeoutHandle);
+  const elapsedMs = Date.now() - startedAt;
+  if (outcome.ok) waits.observe("problem", elapsedMs);
+  else waits.failure("problem");
+  emit({ event: "handoff", elapsedMs, outcome, adaptive: waits.snapshot("problem") });
+  return outcome;
+}
+
 async function reconcileAnswerAfterFailure(page, waits, fingerprint) {
   const delayMs = waits.retryDelayFor("answer");
   emit({ event: "answer_reconcile_wait", delayMs });
@@ -326,6 +378,7 @@ async function runAssessment(page, answerProvider, options, account, waits) {
   let attempt = 0;
   let pendingAnswer = null;
   let consecutiveAnswerFailures = 0;
+  let consecutiveUnknownStates = 0;
   for (let step = 0; step < 120; step += 1) {
     await page.waitForTimeout(500);
     body = await page.locator("body").innerText();
@@ -338,11 +391,30 @@ async function runAssessment(page, answerProvider, options, account, waits) {
       return { status: "complete", skipped: false };
     }
     if (body.includes("채점하는 중")) {
+      consecutiveUnknownStates = 0;
       await page.getByText("채점하는 중", { exact: false }).first().waitFor({ state: "hidden", timeout: waits.timeoutFor("answer") }).catch(() => {});
+      continue;
+    }
+    const fullscreen = page.getByRole("button", { name: "전체화면으로 시작하기", exact: true });
+    if (await fullscreen.isVisible().catch(() => false)) {
+      consecutiveUnknownStates = 0;
+      const checkbox = page.locator("input[type=checkbox]").first();
+      const checkboxControl = page.getByRole("checkbox").first();
+      if (await checkboxControl.isVisible().catch(() => false)) await checkboxControl.check();
+      else if (await checkbox.count()) await checkbox.setChecked(true, { force: true });
+      if (!(await fullscreen.isEnabled())) fail("READY_CHECKBOX_FAILED", "세션 준비 확인란이 선택되지 않았습니다.");
+      const outcome = await waitForApiOutcome(page, waits, {
+        category: "session",
+        method: "POST",
+        path: /\/api\/v0\/assessment-sessions\/[^/]+\/start$/u,
+        action: () => fullscreen.click(),
+      });
+      if (outcome.kind !== "response" || !outcome.ok) fail("SESSION_START_NETWORK_FAILED", "세션 시작 응답을 받지 못했습니다.", { outcome });
       continue;
     }
     const textarea = page.locator("textarea:visible").first();
     if (await textarea.isVisible().catch(() => false)) {
+      consecutiveUnknownStates = 0;
       if (!pendingAnswer) pendingAnswer = await askForAnswer(answerProvider, account, page, attempt);
       const { answer, fingerprint } = pendingAnswer;
       if ((await textarea.inputValue()).normalize("NFC") !== answer.normalize("NFC")) await pressVerified(textarea, answer);
@@ -384,18 +456,20 @@ async function runAssessment(page, answerProvider, options, account, waits) {
     }
     const handoff = page.getByRole("button", { name: "시작하기", exact: true });
     if (await handoff.isVisible().catch(() => false)) {
+      consecutiveUnknownStates = 0;
       await journal(options.ledgerPath, { event: "handoff_intent", accountId: account.accountId, teamName: account.teamName });
       const before = body;
-      const outcome = await waitForApiOutcome(page, waits, {
-        category: "problem",
-        method: "GET",
-        path: /\/api\/v0\/assessment-sessions\/[^/]+\/problems\/\d+$/u,
-        action: () => handoff.click(),
-      });
-      if (outcome.kind !== "response" || !outcome.ok) fail("PROBLEM_NETWORK_FAILED", "다음 코드 포인트 정보를 받지 못했습니다.", { outcome });
+      const outcome = await waitForProblemHandoff(page, waits, handoff, before);
+      if (!outcome.ok) fail("PROBLEM_NETWORK_FAILED", "다음 코드 포인트 정보를 받지 못했습니다.", { outcome });
       await waitForRenderedState(page, before, waits, "problem");
       await journal(options.ledgerPath, { event: "handoff_confirmed", accountId: account.accountId, teamName: account.teamName });
       attempt = 0;
+      continue;
+    }
+    consecutiveUnknownStates += 1;
+    if (consecutiveUnknownStates <= 20) {
+      if (consecutiveUnknownStates === 1) emit({ event: "session_state_wait", className: options.className, teamName: account.teamName, accountId: account.accountId });
+      await page.waitForTimeout(500);
       continue;
     }
     fail("UNKNOWN_SESSION_STATE", "처리하지 않은 세션 화면입니다.", { visibleText: body.slice(0, 2_000) });
@@ -452,6 +526,7 @@ export async function runPlaywrightClass({ browser, options, answerProvider, tea
         accountId: result.failedAccount.accountId,
         code: result.error?.code ?? "PLAYWRIGHT_TEAM_FAILED",
         message: result.error?.message ?? String(result.error),
+        details: result.error?.details ?? {},
       });
     }
   }

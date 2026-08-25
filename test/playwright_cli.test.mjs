@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { AdaptiveNetworkWaits, isIgnorableRequestFailure, parseArgs, parseTraineeButtonLabel, promptFingerprint, redactApiUrl } from "../bin/realize-playwright.mjs";
+import { AdaptiveNetworkWaits, isIgnorableRequestFailure, isProblemHandoffUi, parseArgs, parseTraineeButtonLabel, promptFingerprint, redactApiUrl } from "../bin/realize-playwright.mjs";
 
 test("standalone CLI parses class and one-based resume index", () => {
   const options = parseArgs(["--class", "f", "--start-at", "3", "--limit", "1", "--headed"]);
@@ -52,4 +52,10 @@ test("prompt fingerprints ignore countdown and retry counters", () => {
   const later = promptFingerprint("문제\n이 문제 00:18:08 남음\n143자\n1번 남음", ["code"]);
   assert.equal(first, later);
   assert.notEqual(first, promptFingerprint("다른 문제\n이 문제 00:20:00 남음\n0자\n2번 남음", ["code"]));
+});
+
+test("handoff UI requires a real next prompt or completion, not only timer text", () => {
+  assert.equal(isProblemHandoffUi("handoff 20:00", "handoff 19:59", false), false);
+  assert.equal(isProblemHandoffUi("handoff", "next prompt", true), true);
+  assert.equal(isProblemHandoffUi("handoff", "이해도 확인이 끝났어요", false), true);
 });
