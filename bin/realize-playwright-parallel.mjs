@@ -7,7 +7,7 @@ import { stdin, stdout } from "node:process";
 import { chromium } from "playwright-core";
 
 import { emit, runPlaywrightClass } from "./realize-playwright.mjs";
-import { mapConcurrent, normalizeClassList, SerialAnswerBroker } from "../src/parallel_scheduler.mjs";
+import { ExactAnswerMemo, mapConcurrent, normalizeClassList, SerialAnswerBroker } from "../src/parallel_scheduler.mjs";
 
 const DEFAULT_BASE_URL = "https://frontend-eight-neon-73.vercel.app";
 const DEFAULT_CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
@@ -95,6 +95,16 @@ export async function main(argv) {
     }),
     onActive: ({ requestId, waiting, payload }) => emit({ event: "answer_required", requestId, waiting, ...payload }),
   });
+  const answerMemo = options.dryRun ? null : new ExactAnswerMemo({
+    resolveAnswer: (payload) => broker.request(payload),
+    onReuse: ({ fingerprint, source, payload }) => emit({
+      event: "answer_reused",
+      fingerprint,
+      source,
+      account: publicAccount(payload.account),
+      attempt: payload.attempt,
+    }),
+  });
 
   emit({
     event: "parallel_plan",
@@ -122,7 +132,7 @@ export async function main(argv) {
         return await runPlaywrightClass({
           browser,
           options: classOptions,
-          answerProvider: options.dryRun ? async () => fail("DRY_RUN_ANSWER", "Dry run must not request an answer.") : (payload) => broker.request(payload),
+          answerProvider: options.dryRun ? async () => fail("DRY_RUN_ANSWER", "Dry run must not request an answer.") : (payload) => answerMemo.request(payload),
           teamConcurrency: options.teamConcurrency,
           dryRun: options.dryRun,
         });

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { parseParallelArgs } from "../bin/realize-playwright-parallel.mjs";
-import { groupAccountsByTeam, mapConcurrent, normalizeClassList, runTeamLanes, SerialAnswerBroker } from "../src/parallel_scheduler.mjs";
+import { ExactAnswerMemo, groupAccountsByTeam, mapConcurrent, normalizeClassList, runTeamLanes, SerialAnswerBroker } from "../src/parallel_scheduler.mjs";
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 
@@ -102,6 +102,33 @@ test("central answer broker serializes concurrent questions", async () => {
   assert.deepEqual(queued, ["q000001", "q000002", "q000003"]);
   assert.deepEqual(active, queued);
   assert.deepEqual(answers, queued.map((requestId) => `answer-${requestId}`));
+});
+
+test("exact answer memo deduplicates only identical prompt fingerprints", async () => {
+  const firstFingerprint = `sha256:${"a".repeat(64)}`;
+  const secondFingerprint = `sha256:${"b".repeat(64)}`;
+  let resolutions = 0;
+  const reused = [];
+  const memo = new ExactAnswerMemo({
+    resolveAnswer: async ({ fingerprint }) => {
+      resolutions += 1;
+      await tick();
+      return `answer-${fingerprint.slice(-1)}`;
+    },
+    onReuse: ({ fingerprint, source }) => reused.push({ fingerprint, source }),
+  });
+  const [first, duplicate, second] = await Promise.all([
+    memo.request({ fingerprint: firstFingerprint }),
+    memo.request({ fingerprint: firstFingerprint }),
+    memo.request({ fingerprint: secondFingerprint }),
+  ]);
+  assert.equal(resolutions, 2);
+  assert.equal(first, duplicate);
+  assert.notEqual(first, second);
+  assert.deepEqual(reused, [{ fingerprint: firstFingerprint, source: "inflight" }]);
+  assert.equal(await memo.request({ fingerprint: firstFingerprint }), first);
+  assert.equal(resolutions, 2);
+  assert.equal(reused.at(-1).source, "memory");
 });
 
 test("class list normalization is strict", () => {

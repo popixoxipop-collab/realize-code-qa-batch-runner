@@ -96,3 +96,40 @@ export class SerialAnswerBroker {
     return task;
   }
 }
+
+export class ExactAnswerMemo {
+  constructor({ resolveAnswer, onReuse = () => {}, onStore = () => {} }) {
+    invariant(typeof resolveAnswer === "function", "INVALID_ANSWER_RESOLVER", "resolveAnswer must be a function.");
+    this.resolveAnswer = resolveAnswer;
+    this.onReuse = onReuse;
+    this.onStore = onStore;
+    this.answers = new Map();
+    this.inflight = new Map();
+  }
+
+  request(payload) {
+    const fingerprint = String(payload?.fingerprint ?? "");
+    invariant(/^sha256:[a-f0-9]{64}$/u.test(fingerprint), "INVALID_FINGERPRINT", "An exact SHA-256 prompt fingerprint is required.");
+    if (this.answers.has(fingerprint)) {
+      this.onReuse({ fingerprint, source: "memory", payload });
+      return Promise.resolve(this.answers.get(fingerprint));
+    }
+    if (this.inflight.has(fingerprint)) {
+      this.onReuse({ fingerprint, source: "inflight", payload });
+      return this.inflight.get(fingerprint);
+    }
+
+    const task = Promise.resolve()
+      .then(() => this.resolveAnswer(payload))
+      .then((value) => {
+        const answer = String(value).normalize("NFC").trim();
+        invariant(answer.length > 0, "EMPTY_ANSWER", "Answer must not be empty.");
+        this.answers.set(fingerprint, answer);
+        this.onStore({ fingerprint, payload });
+        return answer;
+      })
+      .finally(() => this.inflight.delete(fingerprint));
+    this.inflight.set(fingerprint, task);
+    return task;
+  }
+}
