@@ -122,6 +122,10 @@ function apiMatches(request, { method, path }) {
   return typeof path === "string" ? pathname === path : path.test(pathname);
 }
 
+export function isIgnorableRequestFailure(errorText) {
+  return errorText === "net::ERR_ABORTED";
+}
+
 export function redactApiUrl(rawUrl) {
   const url = new URL(rawUrl);
   url.pathname = url.pathname
@@ -143,7 +147,7 @@ async function waitForApiOutcome(page, waits, { category, method, path, action }
     })
     .catch(() => new Promise(() => {}));
   const failed = page.waitForEvent("requestfailed", {
-    predicate: (request) => apiMatches(request, { method, path }),
+    predicate: (request) => apiMatches(request, { method, path }) && !isIgnorableRequestFailure(request.failure()?.errorText),
     timeout: timeoutMs,
   }).then((request) => ({ kind: "requestfailed", failure: request.failure()?.errorText ?? "request failed", url: redactApiUrl(request.url()) }))
     .catch(() => new Promise(() => {}));

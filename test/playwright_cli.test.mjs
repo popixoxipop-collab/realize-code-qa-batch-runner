@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { AdaptiveNetworkWaits, parseArgs, parseTraineeButtonLabel, promptFingerprint, redactApiUrl } from "../bin/realize-playwright.mjs";
+import { AdaptiveNetworkWaits, isIgnorableRequestFailure, parseArgs, parseTraineeButtonLabel, promptFingerprint, redactApiUrl } from "../bin/realize-playwright.mjs";
 
 test("standalone CLI parses class and one-based resume index", () => {
   const options = parseArgs(["--class", "f", "--start-at", "3", "--limit", "1", "--headed"]);
@@ -40,6 +40,11 @@ test("network logs redact session identifiers and query parameters", () => {
     redactApiUrl("https://example.com/api/v0/assessment-sessions/c2a9bbe5-f55f-4f2d-9217-7093483e06c3/answers?debug=true"),
     "https://example.com/api/v0/assessment-sessions/:sessionId/answers",
   );
+});
+
+test("route-change request cancellation is ignored while real network failures are observed", () => {
+  assert.equal(isIgnorableRequestFailure("net::ERR_ABORTED"), true);
+  assert.equal(isIgnorableRequestFailure("net::ERR_CONNECTION_RESET"), false);
 });
 
 test("prompt fingerprints ignore countdown and retry counters", () => {
