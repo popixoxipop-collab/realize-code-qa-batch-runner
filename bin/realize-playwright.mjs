@@ -508,9 +508,24 @@ async function requestPlannedHints(page, hintCountProvider, account, options, wa
     if (outcome.kind !== "response" || !outcome.ok) {
       fail("HINT_API_FAILED", "힌트 API 응답을 받지 못했습니다.", { outcome, desired, used });
     }
-    await waitForRenderedState(page, before, waits, "hint");
+    const rendered = await waitForRenderedState(page, before, waits, "hint").then(() => true).catch(() => false);
     prompt = await capturePrompt(page);
-    const nextHintsLeft = hintsLeftFromVisibleText(prompt.visibleText);
+    let nextHintsLeft = hintsLeftFromVisibleText(prompt.visibleText);
+    if (!rendered || nextHintsLeft === null || nextHintsLeft >= hintsLeft) {
+      const reconciliation = await waitForApiOutcome(page, waits, {
+        category: "session",
+        method: "GET",
+        path: /\/api\/v0\/assessment-sessions\/(?:current|[^/]+(?:\/problems\/\d+)?)$/u,
+        action: () => page.reload({ waitUntil: "domcontentloaded", timeout: waits.timeoutFor("session") }),
+      });
+      if (reconciliation.kind !== "response" || !reconciliation.ok) {
+        fail("HINT_RECONCILE_NETWORK_FAILED", "힌트 응답 후 세션 상태를 재조회하지 못했습니다.", { reconciliation, desired, used });
+      }
+      await page.waitForTimeout(300);
+      prompt = await capturePrompt(page);
+      nextHintsLeft = hintsLeftFromVisibleText(prompt.visibleText);
+      emit({ event: "hint_reconciled", className: account.className, teamName: account.teamName, accountId: account.accountId, desired, used, nextHintsLeft });
+    }
     if (nextHintsLeft === null || nextHintsLeft >= hintsLeft) {
       fail("HINT_NOT_REFLECTED", "힌트 응답이 화면의 남은 횟수에 반영되지 않았습니다.", { hintsLeft, nextHintsLeft });
     }
