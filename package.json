@@ -1,6 +1,6 @@
 {
   "name": "realize-code-qa-batch-runner",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Class-selectable, team-parallel and resumable runner for authorized RealiZe code-understanding QA.",
   "type": "module",
   "private": false,
@@ -13,6 +13,7 @@
     ".env.example",
     "bin",
     "src",
+    "scripts",
     "examples",
     "README.md",
     "LICENSE"
@@ -22,9 +23,10 @@
     "playwright:class": "node bin/realize-playwright.mjs",
     "playwright:parallel": "node bin/realize-playwright-parallel.mjs",
     "autonomous": "node bin/realize-playwright-parallel.mjs --autonomous",
+    "smoke:gmi": "node scripts/gmi-smoke.mjs",
     "test": "node --test test/*.test.mjs",
     "test:runner": "node --test test/realize_batch_runner.test.mjs",
-    "check": "node --check bin/realize-batch.mjs && node --check bin/realize-playwright.mjs && node --check bin/realize-playwright-parallel.mjs && node --check src/gmi_answer_provider.mjs"
+    "check": "node --check bin/realize-batch.mjs && node --check bin/realize-playwright.mjs && node --check bin/realize-playwright-parallel.mjs && node --check src/gmi_answer_provider.mjs && node --check src/qa_scenarios.mjs && node --check scripts/gmi-smoke.mjs"
   },
   "engines": {
     "node": ">=20"

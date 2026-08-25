@@ -14,6 +14,7 @@ The current default review repository is [Team-IZ/Backend](https://github.com/Te
 - Effective concurrency capped by requested lanes, team count, and verified isolated profiles
 - One repository submission per team, followed by analysis wait and account sessions
 - Direct GMI Cloud answer generation through its OpenAI-compatible API
+- Deterministic per-class QA scenarios with explicit 0/1/2-hint behavior
 - Atomic JSON resume ledger with run-anchor validation
 - Write-ahead/confirmed journal and unresolved-intent reporting
 - Credential-shaped field/value rejection before ledger writes
@@ -51,6 +52,12 @@ GMI_API_KEY=replace-with-the-real-key
 GMI_MODEL=MiniMaxAI/MiniMax-M3
 ```
 
+Optionally verify authentication with one small request. The command prints only success/failure metadata, never the key or generated answer:
+
+```bash
+npm run smoke:gmi
+```
+
 Preview the live roster and execution plan without logging in, submitting, starting a session, or calling GMI:
 
 ```bash
@@ -68,6 +75,33 @@ npm run autonomous -- \
   --llm-concurrency 8 \
   --yes
 ```
+
+Run multiple behavior scenarios in one unattended command:
+
+```bash
+npm run autonomous -- \
+  --classes D,F,H,C,I,J,E,G \
+  --scenario excellent:D,F \
+  --scenario moderate:H,C \
+  --scenario struggling:I,J \
+  --scenario inactive:E,G \
+  --repo https://github.com/Team-IZ/Backend \
+  --class-concurrency 8 \
+  --team-concurrency 5 \
+  --llm-concurrency 40 \
+  --yes
+```
+
+Each selected class must appear in exactly one `--scenario PROFILE:CLASSES` assignment. Repeated classes are rejected instead of being run twice. With no explicit scenario, autonomous mode remains backward-compatible and assigns every selected class to `excellent`.
+
+| Profile | Hint behavior | Answer behavior |
+| --- | --- | --- |
+| `excellent` | Requests no hint | GMI produces a direct, technically detailed answer |
+| `moderate` | Deterministically requests 1 or 2 hints per question | GMI answers correctly from the expanded explanation |
+| `struggling` | Requests both hints | Usually gives a simpler passing answer; a deterministic 20% of account/question cases still give an insufficient answer |
+| `inactive` | Requests both hints | Always gives a fixed non-answer and does not spend an LLM call |
+
+The deterministic choices use a one-way hash of the pseudonymous account ID, question number, and visible code, so rerunning the same account/question reproduces the same scenario. Hint requests wait for the matching `POST /assessment-sessions/{sessionId}/hints` response and verify that the visible remaining count decreased before an answer is generated. Scenario-specific memo keys prevent an answer generated for one profile from leaking into another profile.
 
 For all configured classes, change `--classes` to `A,B,C,D,E,F` and choose a class concurrency appropriate for the machine. The autonomous path performs this sequence in every team lane:
 
@@ -97,6 +131,7 @@ Useful autonomous options:
 --gmi-model ID                default MiniMaxAI/MiniMax-M3
 --gmi-api-url URL             override only for an OpenAI-compatible endpoint
 --env-file FILE               local environment file; default .env
+--scenario PROFILE:CLASSES    repeatable class behavior assignment
 --start-at N                  1-based trainee resume offset per class
 --limit-per-class N           bounded verification scope
 --headed                      show Chrome windows

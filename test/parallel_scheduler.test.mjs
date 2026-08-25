@@ -32,6 +32,27 @@ test("autonomous CLI selects GMI, team preparation, and bounded tuning options",
   assert.equal(options.analysisTimeoutMs, 90 * 60_000);
 });
 
+test("autonomous CLI assigns every selected class to exactly one QA scenario", () => {
+  const options = parseParallelArgs([
+    "--autonomous",
+    "--classes", "D,F,H,C,I,J,E,G",
+    "--scenario", "excellent:D,F",
+    "--scenario", "moderate:H,C",
+    "--scenario", "struggling:I,J",
+    "--scenario", "inactive:E,G",
+    "--dry-run",
+  ]);
+  assert.deepEqual(options.scenarioMap, {
+    "D반": "excellent", "F반": "excellent",
+    "H반": "moderate", "C반": "moderate",
+    "I반": "struggling", "J반": "struggling",
+    "E반": "inactive", "G반": "inactive",
+  });
+  assert.throws(() => parseParallelArgs([
+    "--autonomous", "--classes", "D,F", "--scenario", "excellent:D", "--dry-run",
+  ]), { code: "MISSING_SCENARIO_ASSIGNMENT" });
+});
+
 test("bounded scheduler never exceeds configured concurrency", async () => {
   let active = 0;
   let maximum = 0;
@@ -168,6 +189,22 @@ test("exact answer memo deduplicates only identical prompt fingerprints", async 
   assert.equal(await memo.request({ fingerprint: firstFingerprint }), first);
   assert.equal(resolutions, 2);
   assert.equal(reused.at(-1).source, "memory");
+});
+
+test("exact answer memo can isolate the same prompt by scenario mode", async () => {
+  const fingerprint = `sha256:${"c".repeat(64)}`;
+  let resolutions = 0;
+  const memo = new ExactAnswerMemo({
+    keyFor: (payload) => `${payload.responseMode}:${payload.fingerprint}`,
+    resolveAnswer: async ({ responseMode }) => {
+      resolutions += 1;
+      return `answer-${responseMode}`;
+    },
+  });
+  assert.equal(await memo.request({ fingerprint, responseMode: "excellent" }), "answer-excellent");
+  assert.equal(await memo.request({ fingerprint, responseMode: "inactive" }), "answer-inactive");
+  assert.equal(await memo.request({ fingerprint, responseMode: "excellent" }), "answer-excellent");
+  assert.equal(resolutions, 2);
 });
 
 test("class list normalization is strict", () => {

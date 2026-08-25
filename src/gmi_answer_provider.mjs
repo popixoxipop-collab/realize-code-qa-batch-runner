@@ -71,6 +71,12 @@ export function buildGmiMessages(payload, { repositoryUrl = "" } = {}) {
   const retryInstruction = Number(payload?.attempt ?? 0) > 0
     ? "화면에 재설명 요청과 이전 답변이 있다면, 요청의 문구를 문자 그대로 해결하도록 이전 답변을 대체하세요."
     : "질문이 요구하는 실행 흐름, 설계 이유 또는 구체적 실패 사례를 정확히 답하세요.";
+  const responseMode = payload?.responseMode ?? "excellent";
+  const profileInstruction = responseMode === "assisted_correct"
+    ? "화면에 받은 재설명을 활용해 핵심 근거를 빠짐없이 보완한 정답을 작성하세요."
+    : responseMode === "assisted_basic"
+      ? "재설명을 활용하되 숙련도가 낮은 교육생처럼 쉬운 표현을 쓰고, 통과에 필요한 핵심 사실은 정확히 포함하세요."
+      : "숙련된 교육생처럼 실행 흐름과 설계 근거를 구체적으로 연결하세요.";
   return [
     {
       role: "system",
@@ -87,6 +93,8 @@ export function buildGmiMessages(payload, { repositoryUrl = "" } = {}) {
       content: [
         repositoryUrl ? `검토 저장소: ${repositoryUrl}` : null,
         `현재 시도 번호: ${Number(payload?.attempt ?? 0) + 1}`,
+        `QA 답변 프로필: ${responseMode}`,
+        profileInstruction,
         retryInstruction,
         "",
         "[현재 질문 화면]",

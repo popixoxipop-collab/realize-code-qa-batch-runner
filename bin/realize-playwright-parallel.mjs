@@ -9,6 +9,7 @@ import { chromium } from "playwright-core";
 import { createGmiAnswerProvider } from "../src/gmi_answer_provider.mjs";
 import { canonicalRepository, DEFAULT_REPOSITORY_URL, emit, runPlaywrightClass } from "./realize-playwright.mjs";
 import { ExactAnswerMemo, mapConcurrent, normalizeClassList, SerialAnswerBroker } from "../src/parallel_scheduler.mjs";
+import { desiredHintCount, fixedScenarioAnswer, parseScenarioAssignments, scenarioPayload } from "../src/qa_scenarios.mjs";
 
 const DEFAULT_BASE_URL = "https://frontend-eight-neon-73.vercel.app";
 const DEFAULT_CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
@@ -41,6 +42,7 @@ export function parseParallelArgs(argv) {
     gmiModel: null,
     gmiApiUrl: null,
     envFile: resolve(".env"),
+    scenarioSpecs: [],
   };
   for (let index = 0; index < argv.length; index += 1) {
     const option = argv[index];
@@ -74,6 +76,7 @@ export function parseParallelArgs(argv) {
     else if (option === "--gmi-model") options.gmiModel = next();
     else if (option === "--gmi-api-url") options.gmiApiUrl = next();
     else if (option === "--env-file") options.envFile = resolve(next());
+    else if (option === "--scenario") options.scenarioSpecs.push(next());
     else if (option === "--headed") options.headless = false;
     else if (option === "--dry-run") options.dryRun = true;
     else if (option === "--yes") options.yes = true;
@@ -90,6 +93,8 @@ export function parseParallelArgs(argv) {
     fail("INVALID_LIMIT", "--limit-per-class must be a positive integer.");
   }
   if (!["manual", "gmi"].includes(options.answerProvider)) fail("INVALID_ANSWER_PROVIDER", "--answer-provider must be manual or gmi.");
+  if (options.scenarioSpecs.length > 0 && options.answerProvider !== "gmi") fail("SCENARIO_REQUIRES_GMI", "--scenario requires --autonomous or --answer-provider gmi.");
+  options.scenarioMap = parseScenarioAssignments(options.scenarioSpecs, options.classes);
   canonicalRepository(options.repositoryUrl);
   if (!Number.isFinite(options.analysisTimeoutMs) || options.analysisTimeoutMs < 60_000) fail("INVALID_ANALYSIS_TIMEOUT", "--analysis-timeout-minutes must be at least 1.");
   if (!Number.isFinite(options.analysisPollMs) || options.analysisPollMs < 1_000) fail("INVALID_ANALYSIS_POLL", "--analysis-poll-seconds must be at least 1.");
@@ -113,7 +118,7 @@ function publicAccount(account) {
 export async function main(argv) {
   const options = parseParallelArgs(argv);
   if (options.help) {
-    stdout.write("Autonomous: npm run autonomous -- --classes A,B,C,D,E,F --class-concurrency 6 --team-concurrency 5 --yes [--headed]\n");
+    stdout.write("Autonomous: npm run autonomous -- --classes D,F,H,C,I,J,E,G --scenario excellent:D,F --scenario moderate:H,C --scenario struggling:I,J --scenario inactive:E,G --yes\n");
     stdout.write("Manual: npm run playwright:parallel -- --classes A,B,C,D,E,F --class-concurrency 6 --team-concurrency 5 --yes [--headed]\n");
     stdout.write("Preview: npm run autonomous -- --classes A,B,C,D,E,F --dry-run\n");
     return;
@@ -138,15 +143,22 @@ export async function main(argv) {
       onEvent: emit,
     }) : null;
     const answerMemo = options.dryRun ? null : new ExactAnswerMemo({
-      resolveAnswer: (payload) => broker ? broker.request(payload) : gmiProvider(payload),
+      resolveAnswer: (payload) => {
+        if (broker) return broker.request(payload);
+        const fixed = fixedScenarioAnswer(payload.responseMode);
+        return fixed ?? gmiProvider(payload);
+      },
+      keyFor: (payload) => payload.scenarioCacheKey ?? payload.fingerprint,
       onReuse: ({ fingerprint, source, payload }) => emit({
         event: "answer_reused",
         fingerprint,
         source,
         account: publicAccount(payload.account),
         attempt: payload.attempt,
+        scenario: payload.scenario ?? null,
+        responseMode: payload.responseMode ?? null,
       }),
-      onStore: ({ fingerprint, payload }) => emit({ event: "answer_generated", provider: options.answerProvider, fingerprint, account: publicAccount(payload.account), attempt: payload.attempt }),
+      onStore: ({ fingerprint, payload }) => emit({ event: "answer_generated", provider: fixedScenarioAnswer(payload.responseMode) ? "fixed-scenario" : options.answerProvider, fingerprint, account: publicAccount(payload.account), attempt: payload.attempt, scenario: payload.scenario ?? null, responseMode: payload.responseMode ?? null }),
     });
     browser = await chromium.launch({ headless: options.headless, executablePath: options.chromePath });
 
@@ -162,10 +174,12 @@ export async function main(argv) {
       prepareRepository: options.prepareRepository,
       repository: canonicalRepository(options.repositoryUrl).slug,
       llmConcurrency: options.answerProvider === "gmi" ? options.llmConcurrency : null,
+      scenarios: options.scenarioMap,
       dryRun: options.dryRun,
     });
 
     const results = await mapConcurrent(options.classes, options.classConcurrency, async (className) => {
+      const scenario = options.scenarioMap[className];
       const classOptions = {
         className,
         startAt: options.startAt,
@@ -184,7 +198,10 @@ export async function main(argv) {
         return await runPlaywrightClass({
           browser,
           options: classOptions,
-          answerProvider: options.dryRun ? async () => fail("DRY_RUN_ANSWER", "Dry run must not request an answer.") : (payload) => answerMemo.request(payload),
+          answerProvider: options.dryRun
+            ? async () => fail("DRY_RUN_ANSWER", "Dry run must not request an answer.")
+            : (payload) => answerMemo.request(options.answerProvider === "gmi" ? scenarioPayload(payload, scenario) : payload),
+          hintCountProvider: options.answerProvider === "gmi" ? (payload) => desiredHintCount(payload, scenario) : null,
           teamConcurrency: options.teamConcurrency,
           dryRun: options.dryRun,
         });

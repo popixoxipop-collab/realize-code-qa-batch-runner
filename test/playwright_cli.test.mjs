@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { AdaptiveNetworkWaits, canonicalRepository, classifyHomeState, isIgnorableRequestFailure, isProblemHandoffUi, parseArgs, parseTraineeButtonLabel, promptFingerprint, redactApiUrl } from "../bin/realize-playwright.mjs";
+import { AdaptiveNetworkWaits, canonicalRepository, classifyHomeState, hintsLeftFromVisibleText, isIgnorableRequestFailure, isProblemHandoffUi, parseArgs, parseTraineeButtonLabel, promptFingerprint, redactApiUrl } from "../bin/realize-playwright.mjs";
 
 test("standalone CLI parses class and one-based resume index", () => {
   const options = parseArgs(["--class", "f", "--start-at", "3", "--limit", "1", "--headed"]);
@@ -54,6 +54,12 @@ test("prompt fingerprints ignore countdown and retry counters", () => {
   assert.notEqual(first, promptFingerprint("다른 문제\n이 문제 00:20:00 남음\n0자\n2번 남음", ["code"]));
 });
 
+test("visible hint counter recognizes remaining and exhausted states", () => {
+  assert.equal(hintsLeftFromVisibleText("다시 설명해 주세요\n2번 남음"), 2);
+  assert.equal(hintsLeftFromVisibleText("더 이상 설명해 드릴 수 없어요. 아는 만큼만 써 주세요."), 0);
+  assert.equal(hintsLeftFromVisibleText("질문만 있음"), null);
+});
+
 test("handoff UI requires a real next prompt or completion, not only timer text", () => {
   assert.equal(isProblemHandoffUi("handoff 20:00", "handoff 19:59", false), false);
   assert.equal(isProblemHandoffUi("handoff", "next prompt", true), true);
@@ -77,4 +83,6 @@ test("home state classification covers repository preparation and completed sess
   assert.equal(classifyHomeState("이해도 확인을 시작할 차례예요"), "ready");
   assert.equal(classifyHomeState("이해도 확인이 진행 중이에요"), "in_progress");
   assert.equal(classifyHomeState("다시 볼 수 있는 문제가 있어요"), "complete");
+  assert.equal(classifyHomeState("다시 볼 수 있는 문제가 1개 있어요"), "complete");
+  assert.equal(classifyHomeState("리포트가 나왔어요"), "complete");
 });

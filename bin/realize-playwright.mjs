@@ -132,7 +132,7 @@ export function canonicalRepository(value) {
 
 export function classifyHomeState(body) {
   const text = String(body ?? "");
-  if (text.includes("이해도 확인이 끝났어요") || text.includes("리포트를 기다리는 중이에요") || text.includes("다시 볼 수 있는 문제가 있어요")) return "complete";
+  if (text.includes("이해도 확인이 끝났어요") || text.includes("리포트를 기다리는 중이에요") || text.includes("다시 볼 수 있는 문제가") || text.includes("리포트가 나왔어요")) return "complete";
   if (text.includes("이해도 확인이 진행 중이에요")) return "in_progress";
   if (text.includes("이해도 확인을 시작할 차례예요")) return "ready";
   if (text.includes("코드를 분석하지 못했어요")) return "analysis_failed";
@@ -262,8 +262,20 @@ function bodyContainsRepository(body, repository) {
 
 async function openSubmissionPage(page, options, waits) {
   await page.goto(`${options.baseUrl}/trainee/submission`, { waitUntil: "domcontentloaded", timeout: waits.timeoutFor("home") });
-  await page.getByRole("heading", { name: /코드 제출$/u }).waitFor({ timeout: waits.timeoutFor("home") });
-  await page.waitForTimeout(300);
+  await page.waitForFunction(() => {
+    const text = document.body.innerText;
+    return [
+      "저장소 주소", "코드를 분석하지 못했어요", "분석이 끝났어요",
+      "이제 다시 제출할 수 없어요", "제출됐어요. 코드를 분석하고 있습니다",
+      "제출 완료", "제출 기한이 지났어요",
+    ].some((marker) => text.includes(marker));
+  }, undefined, { timeout: waits.timeoutFor("home") }).catch(async () => {
+    fail("SUBMISSION_PAGE_NOT_READY", "코드 제출 화면의 상태 문구가 제한 시간 안에 렌더링되지 않았습니다.", {
+      url: page.url(),
+      visibleText: (await page.locator("body").innerText()).slice(0, 1_500),
+      adaptive: waits.snapshot("home"),
+    });
+  });
   return page.locator("body").innerText();
 }
 
@@ -280,7 +292,7 @@ async function inspectExpectedRepository(page, options, waits, repository) {
   const body = await openSubmissionPage(page, options, waits);
   const state = submissionPageState(body);
   if (!["draft", "submission_closed", "unknown"].includes(state) && !bodyContainsRepository(body, repository)) {
-    fail("REPOSITORY_MISMATCH", "현재 팀에 제출된 저장소가 요청한 저장소와 다릅니다.", { expectedRepository: repository.slug, state });
+    fail("REPOSITORY_MISMATCH", "현재 팀에 제출된 저장소가 요청한 저장소와 다릅니다.", { expectedRepository: repository.slug, state, visibleText: body.slice(0, 1_500) });
   }
   if (state === "analysis_failed") {
     const failureText = body.split("\n").filter(Boolean).slice(0, 30).join("\n");
@@ -456,6 +468,61 @@ async function askForAnswer(answerProvider, account, page, attempt) {
   return { answer, fingerprint };
 }
 
+export function hintsLeftFromVisibleText(visibleText) {
+  const matches = [...String(visibleText ?? "").matchAll(/^(\d+)번 남음$/gmu)];
+  if (matches.length > 0) return Number(matches.at(-1)[1]);
+  if (String(visibleText ?? "").includes("더 이상 설명해 드릴 수 없어요")) return 0;
+  return null;
+}
+
+async function requestPlannedHints(page, hintCountProvider, account, options, waits, attempt) {
+  if (!hintCountProvider) return 0;
+  let prompt = await capturePrompt(page);
+  const desired = Number(await hintCountProvider({
+    account: { className: account.className, teamName: account.teamName, displayName: account.displayName, accountId: account.accountId },
+    attempt,
+    ...prompt,
+  }));
+  if (!Number.isInteger(desired) || desired < 0 || desired > 2) {
+    fail("INVALID_HINT_PLAN", "힌트 계획은 질문당 0~2의 정수여야 합니다.", { desired });
+  }
+  let hintsLeft = hintsLeftFromVisibleText(prompt.visibleText);
+  if (desired > 0 && hintsLeft === null) {
+    fail("HINT_STATE_UNKNOWN", "요청 가능한 힌트 수를 화면에서 확인하지 못했습니다.", { desired });
+  }
+  let used = hintsLeft === null ? 0 : 2 - hintsLeft;
+  let requested = 0;
+  while (used < desired) {
+    const button = page.getByRole("button", { name: "다시 설명해 주세요", exact: true }).first();
+    if (!(await button.isVisible().catch(() => false)) || !(await button.isEnabled().catch(() => false))) {
+      fail("HINT_BUTTON_UNAVAILABLE", "계획된 힌트를 요청할 수 없습니다.", { desired, used, hintsLeft });
+    }
+    const before = await page.locator("body").innerText();
+    await journal(options.ledgerPath, { event: "hint_request_intent", accountId: account.accountId, teamName: account.teamName, fingerprint: prompt.fingerprint, desired, used });
+    const outcome = await waitForApiOutcome(page, waits, {
+      category: "hint",
+      method: "POST",
+      path: /\/api\/v0\/assessment-sessions\/[^/]+\/hints$/u,
+      action: () => button.click(),
+    });
+    if (outcome.kind !== "response" || !outcome.ok) {
+      fail("HINT_API_FAILED", "힌트 API 응답을 받지 못했습니다.", { outcome, desired, used });
+    }
+    await waitForRenderedState(page, before, waits, "hint");
+    prompt = await capturePrompt(page);
+    const nextHintsLeft = hintsLeftFromVisibleText(prompt.visibleText);
+    if (nextHintsLeft === null || nextHintsLeft >= hintsLeft) {
+      fail("HINT_NOT_REFLECTED", "힌트 응답이 화면의 남은 횟수에 반영되지 않았습니다.", { hintsLeft, nextHintsLeft });
+    }
+    hintsLeft = nextHintsLeft;
+    used = 2 - hintsLeft;
+    requested += 1;
+    await journal(options.ledgerPath, { event: "hint_request_confirmed", accountId: account.accountId, teamName: account.teamName, fingerprint: prompt.fingerprint, desired, used });
+    emit({ event: "hint_requested", className: account.className, teamName: account.teamName, accountId: account.accountId, desired, used });
+  }
+  return requested;
+}
+
 async function waitForRenderedState(page, previousText, waits, category) {
   const timeout = Math.min(60_000, Math.max(5_000, waits.timeoutFor(category) / 3));
   await page.waitForFunction((before) => document.body.innerText !== before, previousText, { timeout });
@@ -519,7 +586,7 @@ async function reconcileAnswerAfterFailure(page, waits, fingerprint) {
   return { reflected: current.fingerprint !== fingerprint, state: current.fingerprint === fingerprint ? "same_prompt" : "next_prompt" };
 }
 
-async function runAssessment(page, answerProvider, options, account, waits) {
+async function runAssessment(page, answerProvider, options, account, waits, hintCountProvider = null) {
   let body = await page.locator("body").innerText();
   if (classifyHomeState(body) === "complete") return { status: "complete", skipped: true };
   const continuing = body.includes("이해도 확인이 진행 중이에요");
@@ -599,6 +666,7 @@ async function runAssessment(page, answerProvider, options, account, waits) {
     const textarea = page.locator("textarea:visible").first();
     if (await textarea.isVisible().catch(() => false)) {
       consecutiveUnknownStates = 0;
+      if (!pendingAnswer) await requestPlannedHints(page, hintCountProvider, account, options, waits, attempt);
       if (!pendingAnswer) pendingAnswer = await askForAnswer(answerProvider, account, page, attempt);
       const { answer, fingerprint } = pendingAnswer;
       if ((await textarea.inputValue()).normalize("NFC") !== answer.normalize("NFC")) await pressVerified(textarea, answer);
@@ -661,13 +729,13 @@ async function runAssessment(page, answerProvider, options, account, waits) {
   fail("STEP_LIMIT", "세션 단계 제한을 초과했습니다.");
 }
 
-export async function runPlaywrightAccount({ browser, options, account, answerProvider, waits = new AdaptiveNetworkWaits() }) {
+export async function runPlaywrightAccount({ browser, options, account, answerProvider, hintCountProvider = null, waits = new AdaptiveNetworkWaits() }) {
   const context = await browser.newContext();
   try {
     const page = await context.newPage();
     emit({ event: "account_start", className: options.className, teamName: account.teamName, displayName: account.displayName, accountId: account.accountId });
     await loginAs(page, options, account, waits);
-    const result = await runAssessment(page, answerProvider, options, account, waits);
+    const result = await runAssessment(page, answerProvider, options, account, waits, hintCountProvider);
     emit({ event: "account_result", className: options.className, teamName: account.teamName, displayName: account.displayName, accountId: account.accountId, ...result });
     return { accountId: account.accountId, teamName: account.teamName, ...result };
   } finally {
@@ -675,7 +743,7 @@ export async function runPlaywrightAccount({ browser, options, account, answerPr
   }
 }
 
-export async function runPlaywrightClass({ browser, options, answerProvider, teamConcurrency = 1, dryRun = false }) {
+export async function runPlaywrightClass({ browser, options, answerProvider, hintCountProvider = null, teamConcurrency = 1, dryRun = false }) {
   if (!Number.isInteger(teamConcurrency) || teamConcurrency < 1) fail("INVALID_TEAM_CONCURRENCY", "teamConcurrency must be a positive integer.");
   const roster = (await discoverRoster(browser, options)).map((account) => ({ ...account, className: options.className }));
   const selected = roster
@@ -710,7 +778,7 @@ export async function runPlaywrightClass({ browser, options, answerProvider, tea
         waits: new AdaptiveNetworkWaits(),
       })
       : null,
-    runAccount: async (account) => runPlaywrightAccount({ browser, options, account, answerProvider, waits: new AdaptiveNetworkWaits() }),
+    runAccount: async (account) => runPlaywrightAccount({ browser, options, account, answerProvider, hintCountProvider, waits: new AdaptiveNetworkWaits() }),
   });
   for (const result of results) {
     if (result.status === "failed") {
