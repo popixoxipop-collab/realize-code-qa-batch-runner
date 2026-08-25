@@ -20,6 +20,15 @@ test("visible trainee buttons become pseudonymous records without retaining emai
   assert.equal(parseTraineeButtonLabel("F반 매니저manager@example.com", "F반"), null);
 });
 
+test("current trainee buttons become the same pseudonymous record without exposing a name suffix", () => {
+  const current = parseTraineeButtonLabel("노태현F반 · 1팀", "F반");
+  const spaced = parseTraineeButtonLabel("노태현 F반 · 1팀", "F반");
+  assert.equal(current.teamName, "1팀");
+  assert.equal(current.displayName, "노태현");
+  assert.equal(current.accountId, spaced.accountId);
+  assert.equal(parseTraineeButtonLabel("F반", "F반"), null);
+});
+
 test("answer network waits start conservatively and adapt from measured responses", () => {
   const waits = new AdaptiveNetworkWaits();
   assert.equal(waits.timeoutFor("answer"), 240_000);

@@ -144,12 +144,19 @@ export function classifyHomeState(body) {
 
 export function parseTraineeButtonLabel(label, className) {
   const escaped = className.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
-  const match = new RegExp(`^${escaped} (\\d+팀) (.+?)([A-Za-z][A-Za-z0-9._+-]*@[A-Za-z0-9.-]+)$`, "u").exec(label.trim());
+  const normalized = label.trim();
+  const currentMatch = new RegExp(`^(.+?)\\s*${escaped}\\s*·\\s*(\\d+팀)$`, "u").exec(normalized);
+  const legacyMatch = new RegExp(`^${escaped} (\\d+팀) (.+?)([A-Za-z][A-Za-z0-9._+-]*@[A-Za-z0-9.-]+)$`, "u").exec(normalized);
+  const match = currentMatch
+    ? { teamName: currentMatch[2], displayName: currentMatch[1].trim() }
+    : legacyMatch
+      ? { teamName: legacyMatch[1], displayName: legacyMatch[2].trim() }
+      : null;
   if (!match) return null;
   return Object.freeze({
-    teamName: match[1],
-    displayName: match[2],
-    accountId: createHash("sha256").update(`${className}\0${match[1]}\0${match[2]}`).digest("hex").slice(0, 20),
+    teamName: match.teamName,
+    displayName: match.displayName,
+    accountId: createHash("sha256").update(`${className}\0${match.teamName}\0${match.displayName}`).digest("hex").slice(0, 20),
   });
 }
 
@@ -245,18 +252,44 @@ async function waitForHome(page, expectedName, waits) {
   await page.getByText("지금 할 일", { exact: true }).waitFor({ timeout });
 }
 
+async function openTraineeClassSelector(page, className, timeoutMs) {
+  const traineeTab = page.getByRole("tab", { name: /^교육생\s*\d+$/u });
+  const legacyAccounts = page.getByRole("button", { name: /케이스별 계정/u });
+  const layout = await Promise.race([
+    traineeTab.waitFor({ state: "visible", timeout: timeoutMs }).then(() => "current").catch(() => new Promise(() => {})),
+    legacyAccounts.waitFor({ state: "visible", timeout: timeoutMs }).then(() => "legacy").catch(() => new Promise(() => {})),
+    new Promise((resolveTimeout) => setTimeout(() => resolveTimeout("timeout"), timeoutMs)),
+  ]);
+  if (layout === "current") {
+    await traineeTab.click();
+    await page.getByRole("button", { name: className, exact: true }).click();
+    return "current";
+  }
+  if (layout === "legacy") {
+    await legacyAccounts.click();
+    await page.getByRole("button", { name: new RegExp(`^${className.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}\\d+$`, "u") }).click();
+    return "legacy";
+  }
+  fail("LOGIN_SELECTOR_NOT_READY", "교육생 계정 선택 화면이 제한 시간 안에 렌더링되지 않았습니다.");
+}
+
 async function loginAs(page, options, account, waits) {
   const accountPrefix = `${options.className} ${account.teamName} ${account.displayName}`;
   let lastOutcome;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     await page.goto(`${options.baseUrl}/shared/login`, { waitUntil: "domcontentloaded", timeout: waits.timeoutFor("home") });
-    await page.getByRole("button", { name: /케이스별 계정/u }).click();
-    await page.getByRole("button", { name: new RegExp(`^${options.className}\\d+$`, "u") }).click();
+    const layout = await openTraineeClassSelector(page, options.className, Math.min(30_000, waits.timeoutFor("home")));
+    const escapedName = account.displayName.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+    const escapedClass = options.className.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+    const escapedTeam = account.teamName.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+    const accountButton = layout === "current"
+      ? page.getByRole("button", { name: new RegExp(`^${escapedName}\\s*${escapedClass}\\s*·\\s*${escapedTeam}$`, "u") })
+      : page.getByRole("button", { name: new RegExp(`^${accountPrefix.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}`, "u") });
     lastOutcome = await waitForApiOutcome(page, waits, {
       category: "home",
       method: "GET",
       path: "/api/v0/assessment-rounds",
-      action: () => page.getByRole("button", { name: new RegExp(`^${accountPrefix.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}`, "u") }).click(),
+      action: () => accountButton.click(),
     });
     if (lastOutcome.kind === "response" && lastOutcome.ok) {
       await waitForHome(page, account.displayName, waits);
@@ -478,9 +511,7 @@ export async function discoverRoster(browser, options) {
   try {
     const page = await context.newPage();
     await page.goto(`${options.baseUrl}/shared/login`, { waitUntil: "domcontentloaded", timeout: 30_000 });
-    await page.getByRole("button", { name: /케이스별 계정/u }).click();
-    const classButton = page.getByRole("button", { name: new RegExp(`^${options.className}\\d+$`, "u") });
-    await classButton.click();
+    await openTraineeClassSelector(page, options.className, 30_000);
     const labels = await page.getByRole("button").allTextContents();
     const accounts = labels.map((label) => parseTraineeButtonLabel(label, options.className)).filter(Boolean);
     if (accounts.length === 0) fail("EMPTY_ROSTER", `${options.className} 교육생 계정을 찾지 못했습니다.`);
@@ -791,7 +822,7 @@ async function runAssessment(page, answerProvider, options, account, waits, hint
       attempt += 1;
       continue;
     }
-    const handoff = page.getByRole("button", { name: "시작하기", exact: true });
+    const handoff = page.getByRole("button", { name: /^(시작하기|다음 문제로)$/u }).first();
     if (await handoff.isVisible().catch(() => false)) {
       consecutiveUnknownStates = 0;
       await journal(options.ledgerPath, { event: "handoff_intent", accountId: account.accountId, teamName: account.teamName });
