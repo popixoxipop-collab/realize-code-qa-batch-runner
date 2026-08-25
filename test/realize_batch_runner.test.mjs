@@ -3,11 +3,16 @@ import test from "node:test";
 
 import {
   AdaptiveWaitStats,
+  DEFAULT_REVIEW_REPOSITORY_URL,
   RunnerStop,
   createRealizeBatchRunner,
   fingerprintQuestion,
   typeVerified,
 } from "../src/realize_batch_runner.mjs";
+
+test("public runner default review repository points to Team-IZ Backend", () => {
+  assert.equal(DEFAULT_REVIEW_REPOSITORY_URL, "https://github.com/Team-IZ/Backend");
+});
 
 class FakeTextarea {
   constructor({ corruptFirstChunk = false, clock = null } = {}) {
