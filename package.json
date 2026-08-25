@@ -1,0 +1,15 @@
+{
+  "name": "realize-code-qa-batch-runner",
+  "version": "0.1.0",
+  "description": "Deterministic, resumable browser runner for authorized RealiZe code-understanding QA.",
+  "type": "module",
+  "private": false,
+  "scripts": {
+    "test": "node --test test/realize_batch_runner.test.mjs",
+    "check": "node --check src/realize_batch_runner.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
