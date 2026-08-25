@@ -145,7 +145,7 @@ test("runner fails closed on an unknown exact prompt without clicking submit", a
   let submitClicks = 0;
   const textarea = new FakeTextarea();
   const locators = {
-    account: new FakeLocator({ visible: true, text: "F반 1팀 노태현" }),
+    account: new FakeLocator({ visible: true, text: "F반 1팀 교육생 01" }),
     title: new FakeLocator({ visible: true, text: "BookController" }),
     path: new FakeLocator({ visible: true, text: "src/BookController.java" }),
     lines: new FakeLocator({ visible: true, text: "10-14" }),
@@ -167,7 +167,7 @@ test("runner fails closed on an unknown exact prompt without clicking submit", a
   const runner = createRealizeBatchRunner({
     tab: new FakeTab(locators),
     selectors,
-    expectedAccount: "F반 1팀 노태현",
+    expectedAccount: "F반 1팀 교육생 01",
     answerBank: [{ prompt: knownPrompt, answer: "정확한 은행 답변입니다." }],
     checkpoints: { writeAhead: async () => {}, confirmed: async () => {} },
   });
@@ -177,6 +177,117 @@ test("runner fails closed on an unknown exact prompt without clicking submit", a
     return true;
   });
   assert.equal(submitClicks, 0);
+});
+
+test("an initially visible completion is reported as reconciled without a new checkpoint", async () => {
+  const locators = {
+    account: new FakeLocator({ visible: true, text: "F반 1팀 교육생 01" }),
+    question: new FakeLocator({ visible: false }),
+    textarea: new FakeTextarea(),
+    submit: new FakeLocator({ visible: false, text: "답변 제출" }),
+    grading: new FakeLocator({ visible: false }),
+    reExplain: new FakeLocator({ visible: false }),
+    handoff: new FakeLocator({ visible: false }),
+    handoffButton: new FakeLocator({ visible: false, text: "시작하기" }),
+    completion: new FakeLocator({ visible: true }),
+  };
+  const checkpoints = [];
+  const runner = createRealizeBatchRunner({
+    tab: new FakeTab(locators),
+    selectors,
+    expectedAccount: "F반 1팀 교육생 01",
+    answerBank: [{
+      prompt: { title: "예시", filePath: "Example.java", citedLines: "1", question: "예시 질문" },
+      answer: "예시 답변",
+    }],
+    checkpoints: {
+      writeAhead: async (record) => checkpoints.push(record),
+      confirmed: async (record) => checkpoints.push(record),
+    },
+  });
+  const result = await runner.runAccount();
+  assert.equal(result.status, "complete");
+  assert.equal(result.reconciledCompletion, true);
+  assert.deepEqual(checkpoints, []);
+});
+
+test("resume confirms an unresolved answer intent after grading reaches completion", async () => {
+  const time = virtualTime();
+  let phase = "grading";
+  const prompt = { title: "예시", filePath: "Example.java", citedLines: "1", question: "예시 질문" };
+  const fingerprint = fingerprintQuestion(prompt);
+  const attemptKey = `${fingerprint}:0`;
+  const locators = {
+    account: new FakeLocator({ visible: true, text: "F반 1팀 교육생 01" }),
+    question: new FakeLocator({ visible: false }),
+    textarea: new FakeTextarea(),
+    submit: new FakeLocator({ visible: false, text: "답변 제출" }),
+    grading: new FakeLocator({
+      visible: () => {
+        if (phase === "grading" && time.now() >= 500) phase = "completion";
+        return phase === "grading";
+      },
+    }),
+    reExplain: new FakeLocator({ visible: false }),
+    handoff: new FakeLocator({ visible: false }),
+    handoffButton: new FakeLocator({ visible: false, text: "시작하기" }),
+    completion: new FakeLocator({ visible: () => phase === "completion" }),
+  };
+  const confirmed = [];
+  const runner = createRealizeBatchRunner({
+    tab: new FakeTab(locators),
+    selectors,
+    expectedAccount: "F반 1팀 교육생 01",
+    answerBank: [{ prompt, answer: "예시 답변" }],
+    checkpoints: {
+      writeAhead: async () => { throw new Error("resume must not write a second intent"); },
+      confirmed: async (record) => confirmed.push(record),
+    },
+    resume: { sequence: 1, attempted: [attemptKey], confirmed: [], explanationAttempt: {} },
+    waitStats: new AdaptiveWaitStats({
+      profiles: { grading: { seedMs: 400, minTimeoutMs: 100, maxTimeoutMs: 2_000, minPollMs: 100, maxPollMs: 100 } },
+    }),
+    clock: time.now,
+    sleep: time.sleep,
+  });
+
+  const result = await runner.runAccount();
+  assert.equal(result.status, "complete");
+  assert.equal(result.resume.confirmed.includes(attemptKey), true);
+  assert.equal(confirmed.length, 1);
+  assert.equal(confirmed[0].attemptKey, attemptKey);
+  assert.equal(confirmed[0].visibleState, "completion");
+  assert.equal(confirmed[0].reconciled, true);
+});
+
+test("resume blocks an unresolved answer intent on the ambiguous home screen", async () => {
+  const prompt = { title: "예시", filePath: "Example.java", citedLines: "1", question: "예시 질문" };
+  const attemptKey = `${fingerprintQuestion(prompt)}:0`;
+  let startClicks = 0;
+  const locators = {
+    account: new FakeLocator({ visible: true, text: "F반 1팀 교육생 01" }),
+    question: new FakeLocator({ visible: false }),
+    textarea: new FakeTextarea(),
+    submit: new FakeLocator({ visible: false, text: "답변 제출" }),
+    grading: new FakeLocator({ visible: false }),
+    reExplain: new FakeLocator({ visible: false }),
+    handoff: new FakeLocator({ visible: false }),
+    handoffButton: new FakeLocator({ visible: false, text: "시작하기" }),
+    completion: new FakeLocator({ visible: false }),
+    homeReady: new FakeLocator({ visible: true }),
+    startButton: new FakeLocator({ visible: true, text: "이해도 확인 시작하기", click: () => { startClicks += 1; } }),
+  };
+  const runner = createRealizeBatchRunner({
+    tab: new FakeTab(locators),
+    selectors: { ...selectors, homeReady: "homeReady", startButton: "startButton" },
+    expectedAccount: "F반 1팀 교육생 01",
+    answerBank: [{ prompt, answer: "예시 답변" }],
+    checkpoints: { writeAhead: async () => {}, confirmed: async () => {} },
+    resume: { sequence: 1, attempted: [attemptKey], confirmed: [], explanationAttempt: {} },
+  });
+
+  await assert.rejects(runner.runAccount(), (error) => error.code === "AMBIGUOUS_RESUME");
+  assert.equal(startClicks, 0);
 });
 
 test("grading wait learns from observed fake-tab latency and reaches completion", async () => {
@@ -191,7 +302,7 @@ test("grading wait learns from observed fake-tab latency and reaches completion"
     question: "검색 흐름을 설명하세요.",
   };
   const locators = {
-    account: new FakeLocator({ visible: true, text: "F반 1팀 서윤슬" }),
+    account: new FakeLocator({ visible: true, text: "F반 1팀 교육생 02" }),
     title: new FakeLocator({ visible: () => phase === "question", text: prompt.title }),
     path: new FakeLocator({ visible: () => phase === "question", text: prompt.filePath }),
     lines: new FakeLocator({ visible: () => phase === "question", text: prompt.citedLines }),
@@ -227,7 +338,7 @@ test("grading wait learns from observed fake-tab latency and reaches completion"
   const runner = createRealizeBatchRunner({
     tab: new FakeTab(locators),
     selectors,
-    expectedAccount: "F반 1팀 서윤슬",
+    expectedAccount: "F반 1팀 교육생 02",
     answerBank: [{ prompt, answer: "먼저 키워드 조건을 확인하고 검색 결과를 반환합니다." }],
     checkpoints: {
       writeAhead: async (record) => checkpoints.push(record),

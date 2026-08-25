@@ -1,0 +1,26 @@
+[
+  {
+    "accountId": "f-manager",
+    "displayName": "F반 매니저",
+    "className": "F반",
+    "teamId": "operations",
+    "teamName": "운영",
+    "role": "매니저"
+  },
+  {
+    "accountId": "f-1-01",
+    "displayName": "교육생 01",
+    "className": "F반",
+    "teamId": "1팀",
+    "teamName": "1팀",
+    "role": "교육생"
+  },
+  {
+    "accountId": "f-2-01",
+    "displayName": "교육생 02",
+    "className": "F반",
+    "teamId": "2팀",
+    "teamName": "2팀",
+    "role": "교육생"
+  }
+]

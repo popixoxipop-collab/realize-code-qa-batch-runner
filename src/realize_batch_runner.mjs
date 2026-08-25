@@ -368,6 +368,14 @@ export function createRealizeBatchRunner(options) {
   const explanationAttempt = new Map(Object.entries(options.resume?.explanationAttempt ?? {}).map(([key, value]) => [key, Number(value)]));
   let sequence = Number(options.resume?.sequence ?? 0);
 
+  const unresolvedAnswerAttempts = () => [...attempted].filter((attemptKey) => !confirmed.has(attemptKey));
+
+  const parseAttemptKey = (attemptKey) => {
+    const match = /^(sha256:[a-f0-9]{64}):(\d+)$/.exec(attemptKey);
+    assert(match, "INVALID_RESUME", "Resume data contains an invalid answer attempt key.", { attemptKey });
+    return { fingerprint: match[1], attempt: Number(match[2]), attemptKey };
+  };
+
   const readAccount = async () => {
     if (options.readAccount) return options.readAccount(tab);
     return normalizeVisibleText(await locatorFor(tab, selectors.accountBanner).innerText());
@@ -410,6 +418,38 @@ export function createRealizeBatchRunner(options) {
     at: new Date().toISOString(),
     ...data,
   });
+
+  const reconcileUnresolvedAnswer = async (state) => {
+    const unresolved = unresolvedAnswerAttempts();
+    if (unresolved.length === 0 || state.kind === "grading") return false;
+    assert(
+      unresolved.length === 1,
+      "AMBIGUOUS_RESUME",
+      "More than one answer submit intent is unresolved; refusing to infer which result is visible.",
+      { unresolved },
+    );
+    const pending = parseAttemptKey(unresolved[0]);
+    assert(
+      state.kind !== "home",
+      "AMBIGUOUS_RESUME",
+      "The home screen does not prove whether the unresolved answer submission succeeded; refusing to start or resubmit.",
+      { attemptKey: pending.attemptKey },
+    );
+    if (state.kind === "question" && fingerprintQuestion(state.prompt) === pending.fingerprint) {
+      return false;
+    }
+    await options.checkpoints.confirmed(checkpointRecord("confirmed", "answer_submit", {
+      ...pending,
+      visibleState: state.kind,
+      reconciled: true,
+    }));
+    confirmed.add(pending.attemptKey);
+    explanationAttempt.set(
+      pending.fingerprint,
+      Math.max(explanationAttempt.get(pending.fingerprint) ?? 0, pending.attempt),
+    );
+    return true;
+  };
 
   const waitForInitialState = () => pollUntil(detectState, { category: "homeLoad", waitStats, clock, sleep });
 
@@ -542,10 +582,12 @@ export function createRealizeBatchRunner(options) {
   const runAccount = async () => {
     const actualAccount = await verifyAccount();
     let state = await waitForInitialState();
+    await reconcileUnresolvedAnswer(state);
     for (let step = 0; step < maxSteps; step += 1) {
       if (state.kind === "completion") {
         return {
           status: "complete",
+          reconciledCompletion: step === 0,
           account: actualAccount,
           steps: step,
           waitStats: waitStats.snapshot(),
@@ -564,6 +606,7 @@ export function createRealizeBatchRunner(options) {
           const current = await detectState();
           return current && current.kind !== "grading" ? current : null;
         }, { category: "grading", waitStats, clock, sleep });
+        await reconcileUnresolvedAnswer(state);
       } else if (state.kind === "question" || state.kind === "reExplain") {
         state = await submitAnswer(state);
       } else {

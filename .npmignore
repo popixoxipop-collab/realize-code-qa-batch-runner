@@ -1,8 +1,9 @@
 node_modules/
-*.log
-realize-qa-ledger*.json
 runs/
 realize.config.json
 portal-driver.local.mjs
 *.roster.json
 !examples/*.roster.json
+*.log
+.git/
+.github/

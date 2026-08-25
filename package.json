@@ -1,12 +1,24 @@
 {
   "name": "realize-code-qa-batch-runner",
-  "version": "0.1.0",
-  "description": "Deterministic, resumable browser runner for authorized RealiZe code-understanding QA.",
+  "version": "0.2.0",
+  "description": "Class-selectable, team-parallel and resumable runner for authorized RealiZe code-understanding QA.",
   "type": "module",
   "private": false,
+  "bin": {
+    "realize-batch": "bin/realize-batch.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "examples",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
-    "test": "node --test test/realize_batch_runner.test.mjs",
-    "check": "node --check src/realize_batch_runner.mjs"
+    "batch": "node bin/realize-batch.mjs",
+    "test": "node --test test/*.test.mjs",
+    "test:runner": "node --test test/realize_batch_runner.test.mjs",
+    "check": "node --check bin/realize-batch.mjs"
   },
   "engines": {
     "node": ">=20"

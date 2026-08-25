@@ -1,0 +1,13 @@
+{
+  "driver": "./portal-driver.local.mjs",
+  "repositoryUrl": "https://github.com/Team-IZ/Backend",
+  "round": "replace-with-stable-round-id",
+  "profiles": [
+    "isolated-profile-1",
+    "isolated-profile-2",
+    "isolated-profile-3",
+    "isolated-profile-4",
+    "isolated-profile-5"
+  ],
+  "concurrency": 5
+}
