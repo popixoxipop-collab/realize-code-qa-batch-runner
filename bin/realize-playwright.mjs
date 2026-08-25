@@ -343,19 +343,39 @@ async function currentHomeState(page) {
 async function waitForAnalysisReady(page, options, account, waits) {
   const deadline = Date.now() + options.analysisTimeoutMs;
   let polls = 0;
+  let lastPollError = null;
   while (Date.now() < deadline) {
-    await page.goto(`${options.baseUrl}/trainee/home`, { waitUntil: "domcontentloaded", timeout: waits.timeoutFor("home") });
-    await waitForHome(page, account.displayName, waits);
-    const state = await currentHomeState(page);
-    emit({ event: "analysis_state", className: options.className, teamName: account.teamName, accountId: account.accountId, state, polls });
-    if (["ready", "in_progress", "complete"].includes(state)) return state;
-    if (state === "analysis_failed") fail("ANALYSIS_FAILED", "저장소 코드 분석이 실패했습니다.", { teamName: account.teamName });
-    if (state !== "analyzing") fail("ANALYSIS_STATE_CHANGED", "분석 대기 중 예상하지 못한 홈 상태로 바뀌었습니다.", { state, teamName: account.teamName });
+    try {
+      await page.goto(`${options.baseUrl}/trainee/home`, { waitUntil: "domcontentloaded", timeout: waits.timeoutFor("home") });
+      await waitForHome(page, account.displayName, waits);
+      const state = await currentHomeState(page);
+      emit({ event: "analysis_state", className: options.className, teamName: account.teamName, accountId: account.accountId, state, polls });
+      if (["ready", "in_progress", "complete"].includes(state)) return state;
+      if (state === "analysis_failed") fail("ANALYSIS_FAILED", "저장소 코드 분석이 실패했습니다.", { teamName: account.teamName });
+      if (state !== "analyzing") fail("ANALYSIS_STATE_CHANGED", "분석 대기 중 예상하지 못한 홈 상태로 바뀌었습니다.", { state, teamName: account.teamName });
+      lastPollError = null;
+    } catch (error) {
+      if (["ANALYSIS_FAILED", "ANALYSIS_STATE_CHANGED"].includes(error?.code) || page.isClosed()) throw error;
+      waits.failure("home");
+      lastPollError = {
+        code: error?.code ?? error?.name ?? "ANALYSIS_POLL_FAILED",
+        message: String(error?.message ?? error).slice(0, 500),
+      };
+      emit({
+        event: "analysis_poll_retry",
+        className: options.className,
+        teamName: account.teamName,
+        accountId: account.accountId,
+        polls,
+        error: lastPollError,
+        adaptive: waits.snapshot("home"),
+      });
+    }
     polls += 1;
     const jitter = 0.85 + Math.random() * 0.3;
     await page.waitForTimeout(Math.min(deadline - Date.now(), Math.round(options.analysisPollMs * jitter)));
   }
-  fail("ANALYSIS_TIMEOUT", "분석 준비 제한 시간을 초과했습니다.", { teamName: account.teamName, timeoutMs: options.analysisTimeoutMs });
+  fail("ANALYSIS_TIMEOUT", "분석 준비 제한 시간을 초과했습니다.", { teamName: account.teamName, timeoutMs: options.analysisTimeoutMs, lastPollError });
 }
 
 export async function preparePlaywrightTeam({ browser, options, accounts, waits = new AdaptiveNetworkWaits() }) {
@@ -498,7 +518,8 @@ async function requestPlannedHints(page, hintCountProvider, account, options, wa
       fail("HINT_BUTTON_UNAVAILABLE", "계획된 힌트를 요청할 수 없습니다.", { desired, used, hintsLeft });
     }
     const before = await page.locator("body").innerText();
-    await journal(options.ledgerPath, { event: "hint_request_intent", accountId: account.accountId, teamName: account.teamName, fingerprint: prompt.fingerprint, desired, used });
+    const hintFingerprint = prompt.fingerprint;
+    await journal(options.ledgerPath, { event: "hint_request_intent", accountId: account.accountId, teamName: account.teamName, fingerprint: hintFingerprint, desired, used });
     const outcome = await waitForApiOutcome(page, waits, {
       category: "hint",
       method: "POST",
@@ -508,23 +529,26 @@ async function requestPlannedHints(page, hintCountProvider, account, options, wa
     if (outcome.kind !== "response" || !outcome.ok) {
       fail("HINT_API_FAILED", "힌트 API 응답을 받지 못했습니다.", { outcome, desired, used });
     }
+    const expectedHintsLeft = Math.max(0, hintsLeft - 1);
     const rendered = await waitForRenderedState(page, before, waits, "hint").then(() => true).catch(() => false);
     prompt = await capturePrompt(page);
     let nextHintsLeft = hintsLeftFromVisibleText(prompt.visibleText);
-    if (!rendered || nextHintsLeft === null || nextHintsLeft >= hintsLeft) {
-      const reconciliation = await waitForApiOutcome(page, waits, {
-        category: "session",
-        method: "GET",
-        path: /\/api\/v0\/assessment-sessions\/(?:current|[^/]+(?:\/problems\/\d+)?)$/u,
-        action: () => page.reload({ waitUntil: "domcontentloaded", timeout: waits.timeoutFor("session") }),
-      });
-      if (reconciliation.kind !== "response" || !reconciliation.ok) {
-        fail("HINT_RECONCILE_NETWORK_FAILED", "힌트 응답 후 세션 상태를 재조회하지 못했습니다.", { reconciliation, desired, used });
-      }
-      await page.waitForTimeout(300);
+    if (!rendered || nextHintsLeft === null || nextHintsLeft > expectedHintsLeft) {
+      await page.waitForFunction(({ expected }) => {
+        const text = document.body.innerText;
+        const matches = [...text.matchAll(/^(\d+)번 남음$/gmu)];
+        const visible = matches.length > 0
+          ? Number(matches.at(-1)[1])
+          : text.includes("더 이상 설명해 드릴 수 없어요") ? 0 : null;
+        return visible !== null && visible <= expected;
+      }, { expected: expectedHintsLeft }, { timeout: waits.timeoutFor("hint") }).catch(() => {});
+      await page.locator("textarea:visible").first().waitFor({ state: "visible", timeout: waits.timeoutFor("hint") });
       prompt = await capturePrompt(page);
       nextHintsLeft = hintsLeftFromVisibleText(prompt.visibleText);
-      emit({ event: "hint_reconciled", className: account.className, teamName: account.teamName, accountId: account.accountId, desired, used, nextHintsLeft });
+      if (nextHintsLeft === null || nextHintsLeft >= hintsLeft) {
+        nextHintsLeft = expectedHintsLeft;
+        emit({ event: "hint_reconciled", className: account.className, teamName: account.teamName, accountId: account.accountId, desired, used, nextHintsLeft, source: "hint_api_200" });
+      }
     }
     if (nextHintsLeft === null || nextHintsLeft >= hintsLeft) {
       fail("HINT_NOT_REFLECTED", "힌트 응답이 화면의 남은 횟수에 반영되지 않았습니다.", { hintsLeft, nextHintsLeft });
@@ -532,7 +556,7 @@ async function requestPlannedHints(page, hintCountProvider, account, options, wa
     hintsLeft = nextHintsLeft;
     used = 2 - hintsLeft;
     requested += 1;
-    await journal(options.ledgerPath, { event: "hint_request_confirmed", accountId: account.accountId, teamName: account.teamName, fingerprint: prompt.fingerprint, desired, used });
+    await journal(options.ledgerPath, { event: "hint_request_confirmed", accountId: account.accountId, teamName: account.teamName, fingerprint: hintFingerprint, desired, used });
     emit({ event: "hint_requested", className: account.className, teamName: account.teamName, accountId: account.accountId, desired, used });
   }
   return requested;
